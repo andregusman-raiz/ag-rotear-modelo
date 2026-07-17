@@ -87,7 +87,7 @@ def _open_directory_flags() -> int:
 
 
 def _open_regular_flags() -> int:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):
@@ -878,7 +878,12 @@ def publish_ready(input_dir: Path, nonce: str) -> None:
                 os.close(task)
                 task = -1
         manifest = _build_ready_manifest(request_snapshot, task_snapshot, nonce)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+        )
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         staged = os.open(
@@ -965,7 +970,12 @@ def _publish_ready_path(input_dir: Path, nonce: str) -> None:
         )
         task_snapshot = _snapshot_task_descriptor(task)
         manifest = _build_ready_manifest(request_snapshot, task_snapshot, nonce)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+        )
         staged = os.open(str(staged_path), flags, 0o600)
         _write_all(staged, manifest)
         os.fsync(staged)

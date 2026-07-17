@@ -1112,6 +1112,7 @@ class RuntimeStateTests(unittest.TestCase):
                 runtime.write_decision("round-trip", payload)
             self.assertFalse((runtime.runs_dir / "round-trip").exists())
 
+    @unittest.skipUnless(POSIX, "POSIX descriptor publication race only")
     def test_concurrent_key_creation_is_single_and_keeps_racing_decision_auditable(self):
         import model_router.state as state_module
         from support import complete_decision_payload
@@ -1397,6 +1398,7 @@ class RuntimeStateTests(unittest.TestCase):
                     list(runtime.root.glob(".decision-hmac-key.tmp-*")),
                 )
 
+    @unittest.skipUnless(POSIX, "POSIX hard-link cleanup semantics only")
     def test_unlink_faults_leave_only_recoverable_reserved_orphans(self):
         import model_router.state as state_module
 

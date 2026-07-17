@@ -40,6 +40,10 @@ def _posix_runtime() -> bool:
     return os.name == "posix"
 
 
+def _binary_flags(flags: int) -> int:
+    return flags | getattr(os, "O_BINARY", 0)
+
+
 def _metadata_is_reparse_point(metadata) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
@@ -1458,7 +1462,7 @@ def _directory_open_flags() -> int:
 
 
 def _regular_open_flags() -> int:
-    flags = os.O_RDONLY
+    flags = _binary_flags(os.O_RDONLY)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     return flags
@@ -1526,7 +1530,7 @@ def _cleanup_decision_key_temporaries_path(root: Path) -> None:
     for candidate in root.iterdir():
         if not candidate.name.startswith(_DECISION_KEY_TEMP_PREFIX):
             continue
-        if _path_is_link_like(candidate) or not candidate.is_file():
+        if not _path_is_link_like(candidate) and not candidate.is_file():
             raise StateError("decision integrity key temporary is invalid")
         candidate.unlink()
         removed = True
@@ -1601,19 +1605,22 @@ def _rollback_decision_commit(
         return False
 
 
-def _acquire_runtime_lock(path: Path) -> int:
+def _acquire_runtime_lock(path: Path, *, nonblocking: bool = True) -> int:
     descriptor = -1
     try:
         if _path_is_link_like(path):
             raise StateError("runtime mutation lock must not be a symlink")
-        flags = os.O_CREAT | os.O_RDWR
+        flags = _binary_flags(os.O_CREAT | os.O_RDWR)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(str(path), flags, 0o600)
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise StateError("runtime mutation lock must be a regular file")
         _set_private_descriptor_mode(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        operation = fcntl.LOCK_EX
+        if nonblocking:
+            operation |= fcntl.LOCK_NB
+        fcntl.flock(descriptor, operation)
         return descriptor
     except StateError:
         if descriptor >= 0:
@@ -1656,7 +1663,7 @@ def _mark_runtime_witness_confirmed(path: Path) -> None:
 def _runtime_witness_is_confirmed(path: Path) -> bool:
     descriptor = -1
     try:
-        flags = os.O_RDONLY
+        flags = _binary_flags(os.O_RDONLY)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(str(path), flags)
@@ -1743,7 +1750,7 @@ class RuntimeState:
             if _path_is_link_like(self.root):
                 raise StateError("runtime root must not be a link")
             _set_private_path_mode(self.root, 0o700)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            flags = _binary_flags(os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             descriptor = os.open(str(self.unknown_outcome_path), flags, 0o600)
@@ -1815,7 +1822,7 @@ class RuntimeState:
             self.salt_lock_path
         ):
             raise StateError("project hash salt files must not be symlinks")
-        flags = os.O_CREAT | os.O_RDWR
+        flags = _binary_flags(os.O_CREAT | os.O_RDWR)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(
@@ -1846,7 +1853,7 @@ class RuntimeState:
         temporary_name = None
         try:
             root_descriptor = self._open_bound_root()
-            lock_flags = os.O_CREAT | os.O_RDWR
+            lock_flags = _binary_flags(os.O_CREAT | os.O_RDWR)
             if hasattr(os, "O_NOFOLLOW"):
                 lock_flags |= os.O_NOFOLLOW
             lock_descriptor = os.open(
@@ -1877,7 +1884,9 @@ class RuntimeState:
                 temporary_name = (
                     _DECISION_KEY_TEMP_PREFIX + secrets.token_hex(16)
                 )
-                create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                create_flags = _binary_flags(
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                )
                 if hasattr(os, "O_NOFOLLOW"):
                     create_flags |= os.O_NOFOLLOW
                 key_descriptor = os.open(
@@ -1978,7 +1987,8 @@ class RuntimeState:
         try:
             self._bind_root_path()
             lock_descriptor = _acquire_runtime_lock(
-                self.decision_key_lock_path
+                self.decision_key_lock_path,
+                nonblocking=False,
             )
             _cleanup_decision_key_temporaries_path(self.root)
             if not self.decision_key_path.exists():
@@ -2103,7 +2113,7 @@ class RuntimeState:
                 )
                 + "\n"
             ).encode("utf-8")
-            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            flags = _binary_flags(os.O_WRONLY | os.O_CREAT | os.O_APPEND)
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             descriptor = os.open(

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -51,6 +52,64 @@ class WindowsCompatibilityTests(unittest.TestCase):
 
         self.assertEqual("1.0.0", decision["schema_version"])
 
+    @unittest.skipUnless(WINDOWS, "Windows binary descriptor integration only")
+    def test_windows_runtime_preserves_control_bytes_and_lf(self):
+        import model_router.state as state_module
+        from model_router.state import RuntimeState
+
+        key = b"\x1a\n" * 16
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            state_module.secrets,
+            "token_bytes",
+            return_value=key,
+        ):
+            runtime = RuntimeState(
+                Path(tmp) / "runtime",
+                SCRIPTS.parent / "references",
+            )
+            runtime.bootstrap()
+            self.assertEqual(key, runtime._ensure_decision_key())
+            runtime._record_unknown_outcome()
+
+            self.assertEqual(key, runtime.decision_key_path.read_bytes())
+            self.assertEqual(
+                b"commit-outcome-unknown\n",
+                runtime.unknown_outcome_path.read_bytes(),
+            )
+
+    @unittest.skipUnless(WINDOWS, "Windows key lock integration only")
+    def test_windows_concurrent_bootstrap_serializes_key_creation(self):
+        from model_router.state import RuntimeState
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "runtime"
+            RuntimeState(root, SCRIPTS.parent / "references").bootstrap()
+            (root / ".decision-hmac-key").unlink()
+            barrier = threading.Barrier(3)
+            keys = []
+            errors = []
+
+            def bootstrap():
+                runtime = RuntimeState(root, SCRIPTS.parent / "references")
+                try:
+                    barrier.wait(timeout=5)
+                    runtime.bootstrap()
+                    keys.append(runtime._ensure_decision_key())
+                except Exception as error:
+                    errors.append(error)
+
+            threads = [threading.Thread(target=bootstrap) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=5)
+            for thread in threads:
+                thread.join(timeout=10)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual([], errors)
+            self.assertEqual(2, len(keys))
+            self.assertEqual(keys[0], keys[1])
+
     @unittest.skipUnless(WINDOWS, "Windows lock integration only")
     def test_windows_portable_lock_contends_across_processes(self):
         from model_router.portable_flock import fcntl
@@ -59,8 +118,6 @@ class WindowsCompatibilityTests(unittest.TestCase):
             lock_path = Path(tmp) / "portable.lock"
             descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
             try:
-                os.write(descriptor, b"0")
-                os.lseek(descriptor, 0, os.SEEK_SET)
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 script = """
 import errno
@@ -119,14 +176,14 @@ raise SystemExit(3)
         self.assertEqual(
             [
                 (
-                    "C:/runtime/decision.new",
-                    "C:/runtime/decision.json",
+                    os.fspath(Path("C:/runtime/decision.new")),
+                    os.fspath(Path("C:/runtime/decision.json")),
                     portable_fs.MOVEFILE_REPLACE_EXISTING
                     | portable_fs.MOVEFILE_WRITE_THROUGH,
                 ),
                 (
-                    "C:/runtime/key.new",
-                    "C:/runtime/decision.key",
+                    os.fspath(Path("C:/runtime/key.new")),
+                    os.fspath(Path("C:/runtime/decision.key")),
                     portable_fs.MOVEFILE_WRITE_THROUGH,
                 ),
             ],
@@ -333,6 +390,7 @@ raise SystemExit(3)
             state_module.os,
             "fchmod",
             side_effect=AssertionError("Windows path used fchmod"),
+            create=True,
         ), mock.patch.object(
             state_module.os,
             "open",

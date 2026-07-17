@@ -27,6 +27,10 @@ def _posix_runtime() -> bool:
     return os.name == "posix"
 
 
+def _binary_flags(flags: int) -> int:
+    return flags | getattr(os, "O_BINARY", 0)
+
+
 def _metadata_is_reparse_point(metadata) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
@@ -877,7 +881,7 @@ def _acquire_mutation_lock(path: Path) -> int:
     try:
         if _path_is_link_like(path):
             raise RegistryError("benchmark mutation lock must not be a symlink")
-        flags = os.O_CREAT | os.O_RDWR
+        flags = _binary_flags(os.O_CREAT | os.O_RDWR)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(str(path), flags, 0o600)

@@ -46,6 +46,10 @@ class _PortableFcntl:
             position = 0
         try:
             os.lseek(descriptor, 0, os.SEEK_SET)
+            if not unlock and os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\x00")
+                os.fsync(descriptor)
+                os.lseek(descriptor, 0, os.SEEK_SET)
             msvcrt.locking(descriptor, mode, 1)
         except OSError as error:
             if nonblocking and error.errno in (

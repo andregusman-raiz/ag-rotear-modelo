@@ -881,7 +881,11 @@ policy:
             target.mkdir()
             link = root / "runtime-link"
             link.symlink_to(target, target_is_directory=True)
-            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(home), "USERPROFILE": str(home)},
+                clear=False,
+            ):
                 self.assertEqual(
                     home / "runtime",
                     router_module._runtime_root("~/runtime"),
