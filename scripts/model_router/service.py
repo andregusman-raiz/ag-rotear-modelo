@@ -33,9 +33,13 @@ class RecursionBlocked(RuntimeError):
 
 def classify_execution_failure(execution) -> ValidationResult:
     failure_kind = execution.failure_kind
-    if failure_kind in ("timeout", "spawn"):
+    if failure_kind in ("timeout", "spawn", "transient"):
         return ValidationResult(
             "fail", (), {}, FailureClass.TRANSIENT, None, False
+        )
+    if failure_kind == "capacity":
+        return ValidationResult(
+            "fail", (), {}, FailureClass.CAPACITY, None, False
         )
     if failure_kind == "missing-agent-message":
         return ValidationResult("fail", (), {}, FailureClass.DEPTH, None, False)

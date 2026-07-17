@@ -17,6 +17,12 @@ from typing import Any, Mapping, Optional, Tuple
 
 from .contracts import Effort, FailureClass, Route
 from .profiles import ProfileError, load_profiles
+from .portable_acl import (
+    ensure_private_descriptor,
+    ensure_private_directory,
+    ensure_private_file,
+)
+from .portable_fs import replace_file
 from .portable_flock import fcntl
 from .registry import (
     BenchmarkRegistry,
@@ -28,6 +34,34 @@ from .registry import (
 
 class StateError(ValueError):
     pass
+
+
+def _posix_runtime() -> bool:
+    return os.name == "posix"
+
+
+def _metadata_is_reparse_point(metadata) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+
+
+def _path_is_link_like(path: Path) -> bool:
+    try:
+        metadata = os.lstat(str(path))
+    except OSError:
+        return False
+    return stat.S_ISLNK(metadata.st_mode) or _metadata_is_reparse_point(metadata)
+
+
+def _set_private_descriptor_mode(descriptor: int, mode: int) -> None:
+    ensure_private_descriptor(descriptor, mode)
+
+
+def _set_private_path_mode(path: Path, mode: int) -> None:
+    if Path(path).is_dir():
+        ensure_private_directory(path)
+    else:
+        ensure_private_file(path)
 
 
 SAFE_OBSERVATION_FIELDS = frozenset(
@@ -554,6 +588,8 @@ def _registry_schema_version(path: Path) -> str:
 
 
 def _fsync_directory(path: Path) -> None:
+    if not _posix_runtime():
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
@@ -595,13 +631,13 @@ def _atomic_write_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
             dir=str(path.parent),
         )
         temporary = Path(temporary_name)
-        os.fchmod(descriptor, mode)
+        _set_private_descriptor_mode(descriptor, mode)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             descriptor = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(str(temporary), str(path))
+        replace_file(temporary, path)
         temporary = None
         _fsync_directory(path.parent)
     finally:
@@ -1458,6 +1494,8 @@ def _validate_decision_key_descriptor(
         raise StateError("decision integrity key must be a regular file")
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
         raise StateError("decision integrity key owner is invalid")
+    if not _posix_runtime():
+        return
     mode = stat.S_IMODE(metadata.st_mode)
     if not repair_mode and (mode & 0o077) == 0:
         return
@@ -1465,7 +1503,7 @@ def _validate_decision_key_descriptor(
         raise StateError("decision integrity key permissions are invalid")
     if mode == 0o600:
         return
-    os.fchmod(descriptor, 0o600)
+    _set_private_descriptor_mode(descriptor, 0o600)
     _fsync_file(descriptor)
 
 
@@ -1483,6 +1521,49 @@ def _cleanup_decision_key_temporaries(root_descriptor: int) -> None:
         os.fsync(root_descriptor)
 
 
+def _cleanup_decision_key_temporaries_path(root: Path) -> None:
+    removed = False
+    for candidate in root.iterdir():
+        if not candidate.name.startswith(_DECISION_KEY_TEMP_PREFIX):
+            continue
+        if _path_is_link_like(candidate) or not candidate.is_file():
+            raise StateError("decision integrity key temporary is invalid")
+        candidate.unlink()
+        removed = True
+    if removed:
+        _fsync_directory(root)
+
+
+def _metadata_identity(metadata) -> Tuple[int, int]:
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _open_bound_regular_path(path: Path, label: str) -> int:
+    descriptor = -1
+    try:
+        if _path_is_link_like(path):
+            raise StateError("%s must not be a link" % label)
+        linked = os.stat(str(path), follow_symlinks=False)
+        if not stat.S_ISREG(linked.st_mode) or _metadata_is_reparse_point(linked):
+            raise StateError("%s must be a regular file" % label)
+        descriptor = os.open(str(path), _regular_open_flags())
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _metadata_identity(opened) != _metadata_identity(linked)
+        ):
+            raise StateError("%s identity changed" % label)
+        return descriptor
+    except StateError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise StateError("%s could not be opened safely" % label) from None
+
+
 def _prepare_decision_file(path: Path, payload: bytes) -> Path:
     descriptor = -1
     temporary = None
@@ -1492,7 +1573,7 @@ def _prepare_decision_file(path: Path, payload: bytes) -> Path:
             dir=str(path.parent),
         )
         temporary = Path(temporary_name)
-        os.fchmod(descriptor, 0o600)
+        _set_private_descriptor_mode(descriptor, 0o600)
         _write_all(descriptor, payload)
         _fsync_file(descriptor)
         os.close(descriptor)
@@ -1523,7 +1604,7 @@ def _rollback_decision_commit(
 def _acquire_runtime_lock(path: Path) -> int:
     descriptor = -1
     try:
-        if path.is_symlink():
+        if _path_is_link_like(path):
             raise StateError("runtime mutation lock must not be a symlink")
         flags = os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
@@ -1531,7 +1612,7 @@ def _acquire_runtime_lock(path: Path) -> int:
         descriptor = os.open(str(path), flags, 0o600)
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise StateError("runtime mutation lock must be a regular file")
-        os.fchmod(descriptor, 0o600)
+        _set_private_descriptor_mode(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return descriptor
     except StateError:
@@ -1604,7 +1685,7 @@ class RuntimeState:
             self.seed_root = Path(seed_root)
         except Exception:
             raise StateError("runtime paths are invalid") from None
-        if self.root.is_symlink():
+        if _path_is_link_like(self.root):
             raise StateError("runtime root must not be a symlink")
         self.registry_dir = self.root / "registry"
         self.runs_dir = self.root / "runs"
@@ -1659,11 +1740,15 @@ class RuntimeState:
         self._mutation_blocked = True
         try:
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if _path_is_link_like(self.root):
+                raise StateError("runtime root must not be a link")
+            _set_private_path_mode(self.root, 0o700)
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             descriptor = os.open(str(self.unknown_outcome_path), flags, 0o600)
             try:
+                _set_private_descriptor_mode(descriptor, 0o600)
                 _write_all(descriptor, b"commit-outcome-unknown\n")
                 _fsync_file(descriptor)
             finally:
@@ -1679,18 +1764,21 @@ class RuntimeState:
         self._ensure_mutations_allowed()
         try:
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if _path_is_link_like(self.root):
+                raise StateError("runtime root must not be a link")
+            _set_private_path_mode(self.root, 0o700)
             for directory in (
                 self.registry_dir,
                 self.runs_dir,
                 self.telemetry_dir,
             ):
-                if directory.is_symlink():
+                if _path_is_link_like(directory):
                     raise StateError("runtime directory must not be a symlink")
                 directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-                os.chmod(str(directory), 0o700)
-            if self.model_registry_path.is_symlink():
+                _set_private_path_mode(directory, 0o700)
+            if _path_is_link_like(self.model_registry_path):
                 raise StateError("model registry snapshot must not be a symlink")
-            if self.benchmark_registry_path.is_symlink():
+            if _path_is_link_like(self.benchmark_registry_path):
                 raise StateError("benchmark registry snapshot must not be a symlink")
             if not self.model_registry_path.exists():
                 model_seed = self.seed_root / "model-registry.json"
@@ -1708,8 +1796,11 @@ class RuntimeState:
             BenchmarkRegistry.load(self.benchmark_registry_path)
             self._ensure_salt()
             self._ensure_decision_key()
-            descriptor = self._open_bound_root()
-            os.close(descriptor)
+            if _posix_runtime():
+                descriptor = self._open_bound_root()
+                os.close(descriptor)
+            else:
+                self._bind_root_path()
         except (StateError, RegistryError):
             raise
         except Exception:
@@ -1717,7 +1808,12 @@ class RuntimeState:
 
     def _ensure_salt(self) -> bytes:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if self.salt_path.is_symlink() or self.salt_lock_path.is_symlink():
+        if _path_is_link_like(self.root):
+            raise StateError("runtime root must not be a link")
+        _set_private_path_mode(self.root, 0o700)
+        if _path_is_link_like(self.salt_path) or _path_is_link_like(
+            self.salt_lock_path
+        ):
             raise StateError("project hash salt files must not be symlinks")
         flags = os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
@@ -1728,19 +1824,22 @@ class RuntimeState:
             0o600,
         )
         try:
+            _set_private_descriptor_mode(descriptor, 0o600)
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             if not self.salt_path.exists():
                 _atomic_write_bytes(self.salt_path, secrets.token_bytes(32))
             salt = self.salt_path.read_bytes()
             if len(salt) != 32:
                 raise StateError("project hash salt is invalid")
-            os.chmod(str(self.salt_path), 0o600)
+            _set_private_path_mode(self.salt_path, 0o600)
             return salt
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
     def _ensure_decision_key(self) -> bytes:
+        if not _posix_runtime():
+            return self._ensure_decision_key_path()
         root_descriptor = -1
         lock_descriptor = -1
         key_descriptor = -1
@@ -1763,7 +1862,7 @@ class RuntimeState:
                 )
             if hasattr(os, "getuid") and lock_metadata.st_uid != os.getuid():
                 raise StateError("decision integrity key lock owner is invalid")
-            os.fchmod(lock_descriptor, 0o600)
+            _set_private_descriptor_mode(lock_descriptor, 0o600)
             fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
             _cleanup_decision_key_temporaries(root_descriptor)
 
@@ -1872,6 +1971,81 @@ class RuntimeState:
             if root_descriptor >= 0:
                 os.close(root_descriptor)
 
+    def _ensure_decision_key_path(self) -> bytes:
+        lock_descriptor = -1
+        key_descriptor = -1
+        temporary = None
+        try:
+            self._bind_root_path()
+            lock_descriptor = _acquire_runtime_lock(
+                self.decision_key_lock_path
+            )
+            _cleanup_decision_key_temporaries_path(self.root)
+            if not self.decision_key_path.exists():
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=_DECISION_KEY_TEMP_PREFIX,
+                    dir=str(self.root),
+                )
+                temporary = Path(temporary_name)
+                try:
+                    _set_private_descriptor_mode(descriptor, 0o600)
+                    _write_all(descriptor, secrets.token_bytes(_DECISION_KEY_BYTES))
+                    _fsync_file(descriptor)
+                finally:
+                    os.close(descriptor)
+                replace_file(
+                    temporary,
+                    self.decision_key_path,
+                    replace=False,
+                )
+                temporary = None
+                _fsync_directory(self.root)
+            key_descriptor = _open_bound_regular_path(
+                self.decision_key_path,
+                "decision integrity key",
+            )
+            _validate_decision_key_descriptor(
+                key_descriptor,
+                repair_mode=True,
+            )
+            key = _read_limited_descriptor(
+                key_descriptor,
+                _DECISION_KEY_BYTES,
+            )
+            if len(key) != _DECISION_KEY_BYTES:
+                raise StateError("decision integrity key is invalid")
+            self._bind_root_path()
+            return key
+        except StateError:
+            raise
+        except Exception:
+            raise StateError("decision integrity key could not be read") from None
+        finally:
+            if key_descriptor >= 0:
+                os.close(key_descriptor)
+            _unlink_if_present(temporary)
+            if lock_descriptor >= 0:
+                _release_runtime_lock(lock_descriptor)
+
+    def _bind_root_path(self) -> None:
+        try:
+            if _path_is_link_like(self.root):
+                raise StateError("runtime root must not be a link")
+            metadata = os.stat(str(self.root), follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode) or _metadata_is_reparse_point(
+                metadata
+            ):
+                raise StateError("runtime root must be a directory")
+            identity = _metadata_identity(metadata)
+            if self._root_identity is None:
+                self._root_identity = identity
+            elif self._root_identity != identity:
+                raise StateError("runtime root identity changed")
+        except StateError:
+            raise
+        except OSError:
+            raise StateError("runtime root could not be opened safely") from None
+
     def _open_bound_root(self) -> int:
         descriptor = -1
         try:
@@ -1910,7 +2084,10 @@ class RuntimeState:
         if type(observation) is not Observation:
             _fail("observation", "must be Observation")
         self.telemetry_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if self.telemetry_dir.is_symlink() or self.observations_path.is_symlink():
+        _set_private_path_mode(self.telemetry_dir, 0o700)
+        if _path_is_link_like(self.telemetry_dir) or _path_is_link_like(
+            self.observations_path
+        ):
             raise StateError("telemetry paths must not be symlinks")
         safe = observation.to_safe_dict(
             project_hash=self.project_hash(observation.project_path)
@@ -1935,6 +2112,7 @@ class RuntimeState:
                 0o600,
             )
             try:
+                _set_private_descriptor_mode(descriptor, 0o600)
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
                 offset = 0
                 while offset < len(line):
@@ -2007,7 +2185,8 @@ class RuntimeState:
         )
         key = self._ensure_decision_key()
         self.runs_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if self.runs_dir.is_symlink():
+        _set_private_path_mode(self.runs_dir, 0o700)
+        if _path_is_link_like(self.runs_dir):
             raise StateError("runs directory must not be a symlink")
         run_dir = self.runs_dir / identifier
         path = run_dir / "decision.json"
@@ -2037,13 +2216,14 @@ class RuntimeState:
                     "decision mutation preflight could not be confirmed"
                 ) from None
             run_dir.mkdir(mode=0o700, exist_ok=False)
+            _set_private_path_mode(run_dir, 0o700)
             run_created = True
             _fsync_directory(self.runs_dir)
             document = _signed_decision_document(safe, key)
             if len(document) > MAX_DECISION_BYTES:
                 raise StateError("decision exceeds size limit")
             temporary = _prepare_decision_file(path, document)
-            os.replace(str(temporary), str(path))
+            replace_file(temporary, path)
             temporary = None
             try:
                 _fsync_directory(run_dir)
@@ -2099,6 +2279,8 @@ class RuntimeState:
         identifier = _string(run_id, "run_id")
         if identifier in (".", "..") or _RUN_ID.fullmatch(identifier) is None:
             _fail("run_id", "must be a safe identifier")
+        if not _posix_runtime():
+            return self._read_decision_path(identifier)
         descriptors = []
         try:
             root_descriptor = self._open_bound_root()
@@ -2191,6 +2373,116 @@ class RuntimeState:
         )
         descriptor = self._open_bound_root()
         os.close(descriptor)
+        return safe
+
+    def _read_decision_path(self, identifier: str) -> Mapping[str, Any]:
+        decision_descriptor = -1
+        key_descriptor = -1
+        run_dir = self.runs_dir / identifier
+        decision_path = run_dir / "decision.json"
+        try:
+            self._bind_root_path()
+            for directory, label in (
+                (self.runs_dir, "runs directory"),
+                (run_dir, "run directory"),
+            ):
+                if _path_is_link_like(directory):
+                    raise StateError("%s must not be a link" % label)
+                metadata = os.stat(str(directory), follow_symlinks=False)
+                if not stat.S_ISDIR(metadata.st_mode) or _metadata_is_reparse_point(
+                    metadata
+                ):
+                    raise StateError("%s is invalid" % label)
+            decision_descriptor = _open_bound_regular_path(
+                decision_path,
+                "decision",
+            )
+            decision_identity = _metadata_identity(
+                os.fstat(decision_descriptor)
+            )
+            document_bytes = _read_limited_descriptor(
+                decision_descriptor,
+                MAX_DECISION_BYTES,
+            )
+            key_descriptor = _open_bound_regular_path(
+                self.decision_key_path,
+                "decision integrity key",
+            )
+            key_identity = _metadata_identity(os.fstat(key_descriptor))
+            _validate_decision_key_descriptor(
+                key_descriptor,
+                repair_mode=False,
+            )
+            key = _read_limited_descriptor(
+                key_descriptor,
+                _DECISION_KEY_BYTES,
+            )
+            if len(key) != _DECISION_KEY_BYTES:
+                raise StateError("decision integrity key is invalid")
+            for path, expected, label in (
+                (decision_path, decision_identity, "decision"),
+                (
+                    self.decision_key_path,
+                    key_identity,
+                    "decision integrity key",
+                ),
+            ):
+                if _path_is_link_like(path):
+                    raise StateError("%s identity changed" % label)
+                linked = os.stat(str(path), follow_symlinks=False)
+                if _metadata_identity(linked) != expected:
+                    raise StateError("%s identity changed" % label)
+            document = document_bytes.decode("utf-8")
+            payload = json.loads(
+                document,
+                object_pairs_hook=_strict_object,
+                parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+            )
+            if not isinstance(payload, RuntimeMapping):
+                raise StateError("decision integrity is invalid")
+            integrity = payload.get("integrity")
+            if (
+                not isinstance(integrity, RuntimeMapping)
+                or set(integrity) != {"algorithm", "tag"}
+                or integrity.get("algorithm") != "hmac-sha256"
+                or type(integrity.get("tag")) is not str
+                or _EVIDENCE_DIGEST.fullmatch(integrity["tag"]) is None
+            ):
+                raise StateError("decision integrity is invalid")
+            marker = _decision_hmac_marker(integrity["tag"])
+            if document_bytes.count(marker) != 1:
+                raise StateError("decision integrity is invalid")
+            unsigned = document_bytes.replace(
+                marker,
+                _decision_hmac_marker(_DECISION_HMAC_PLACEHOLDER),
+                1,
+            )
+            expected = hmac.new(
+                key,
+                _DECISION_HMAC_DOMAIN + unsigned,
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(expected, integrity["tag"]):
+                raise StateError("decision integrity is invalid")
+            payload = dict(payload)
+            del payload["integrity"]
+            self._bind_root_path()
+        except StateError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+            raise StateError("decision could not be read") from None
+        finally:
+            for descriptor in (decision_descriptor, key_descriptor):
+                if descriptor >= 0:
+                    os.close(descriptor)
+        registry = self.benchmark_registry()
+        vocabulary = self._decision_vocabulary(registry)
+        safe = _validate_decision_envelope(
+            payload,
+            vocabulary,
+            require_complete=True,
+        )
+        self._bind_root_path()
         return safe
 
     def benchmark_registry(self) -> BenchmarkRegistry:

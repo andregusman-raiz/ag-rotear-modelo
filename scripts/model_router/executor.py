@@ -78,6 +78,35 @@ def _validate_failure_event(event, event_type):
     _require_nonempty_string(event.get("message"), "error.message")
 
 
+def _failure_event_kind(event, event_type):
+    _validate_failure_event(event, event_type)
+    error = event["error"] if event_type == "turn.failed" else event
+    message = error.get("message", "").casefold()
+    error_type = error.get("type")
+    normalized_type = (
+        error_type.casefold().replace("-", "_")
+        if type(error_type) is str
+        else ""
+    )
+    if normalized_type in (
+        "capacity",
+        "model_capacity",
+        "model_overloaded",
+        "overloaded",
+    ) or any(
+        marker in message
+        for marker in (
+            "selected model is at capacity",
+            "model is at capacity",
+            "model capacity is temporarily unavailable",
+        )
+    ):
+        return "capacity"
+    if normalized_type in ("transient", "temporarily_unavailable"):
+        return "transient"
+    return "codex-event"
+
+
 def _require_positive_number(value, path):
     if type(value) not in (int, float):
         raise ExecutionBlocked("%s must be a positive finite number" % path)
@@ -357,8 +386,9 @@ def parse_jsonl(lines: Iterable[str]) -> ExecutionResult:
                 ),
             )
         elif event_type in ("turn.failed", "error"):
-            _validate_failure_event(event, event_type)
-            failure_kind = "codex-event"
+            event_failure = _failure_event_kind(event, event_type)
+            if failure_kind != "capacity" or event_failure == "capacity":
+                failure_kind = event_failure
 
     if thread_id is None:
         raise ExecutionProtocolError("thread_id is required")

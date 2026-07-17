@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from platform_support import DIRECTORY_SYMLINK_AVAILABLE, POSIX
+
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
@@ -271,7 +273,7 @@ class ServiceCliTests(unittest.TestCase):
 
     def test_cli_help_lists_exactly_the_four_public_subcommands(self):
         completed = subprocess.run(
-            ["bash", str(SCRIPTS / "run-route.sh"), "--help"],
+            [sys.executable, str(SCRIPTS / "run-route.py"), "--help"],
             capture_output=True,
             text=True,
             check=False,
@@ -564,6 +566,33 @@ policy:
         self.assertEqual("blocked", result.status)
         self.assertTrue(result.decision_path.is_file())
 
+    def test_capacity_failure_switches_model_instead_of_repeating(self):
+        from support import (
+            execution_result_fixture,
+            passing_report,
+            run_args,
+            service_fixture,
+        )
+
+        capacity = execution_result_fixture(
+            child_report=None,
+            failure_kind="capacity",
+        )
+        recovered = execution_result_fixture(
+            thread_id="capacity-fallback-thread",
+            child_report=passing_report(),
+        )
+        service = service_fixture(execution_results=(capacity, recovered))
+
+        result = service.run(**run_args())
+
+        self.assertEqual("pass", result.status)
+        self.assertEqual(2, service.executor.call_count)
+        self.assertNotEqual(
+            service.executor.calls[0].route.model,
+            service.executor.calls[1].route.model,
+        )
+
     def test_global_gate_block_is_structured_auditable_and_has_no_route(self):
         from support import request_fixture, run_args, service_fixture
 
@@ -837,6 +866,10 @@ policy:
         self.assertNotIn(secret, completed.stderr)
         self.assertEqual("router error: invalid request\n", completed.stderr)
 
+    @unittest.skipUnless(
+        DIRECTORY_SYMLINK_AVAILABLE,
+        "directory symlinks unavailable",
+    )
     def test_runtime_and_cache_paths_expand_to_absolute_without_resolving(self):
         import router as router_module
 
@@ -876,7 +909,7 @@ policy:
     def test_skill_uses_concrete_tool_steps_and_absolute_launcher(self):
         skill = (SCRIPTS.parent / "SKILL.md").read_text(encoding="utf-8")
         for marker in (
-            "diretório temporário privado fora do repositório",
+            "diretório temporário privado fora do workdir",
             "request.json",
             "task.txt",
             "READY",
@@ -884,6 +917,8 @@ policy:
             "0600",
             "--request",
             "--workdir",
+            "--private-temp-root",
+            "AG_MODEL_ROUTER_PRIVATE_TEMP_ROOT",
             "--sandbox",
             "--approval-policy",
             '${CODEX_HOME:-$HOME/.codex}/skills/ag-rotear-modelo/scripts/run-route.sh',
@@ -899,6 +934,10 @@ policy:
             "poll",
             "timeout de preparação",
             "/bin/kill -TERM",
+            "Stop-Process -Id",
+            "DACL protegida",
+            "Selected model is at capacity",
+            "outro modelo",
         ):
             self.assertIn(marker, skill)
         self.assertIn("stdin", skill.lower())
@@ -918,9 +957,9 @@ policy:
             shutil.copytree(SCRIPTS.parent, installed)
             arbitrary_cwd = root / "arbitrary-cwd"
             arbitrary_cwd.mkdir()
-            launcher = installed / "scripts" / "run-route.sh"
+            launcher = installed / "scripts" / "run-route.py"
             completed = subprocess.run(
-                [str(launcher), "--help"],
+                [sys.executable, str(launcher), "--help"],
                 cwd=str(arbitrary_cwd),
                 env={**os.environ, "CODEX_HOME": str(codex_home)},
                 capture_output=True,
@@ -931,6 +970,7 @@ policy:
         self.assertEqual(0, completed.returncode, completed.stderr)
         self.assertIn("promote-registry", completed.stdout)
 
+    @unittest.skipUnless(POSIX, "POSIX shell launcher only")
     def test_absolute_launcher_receives_task_file_exactly_then_eof_and_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

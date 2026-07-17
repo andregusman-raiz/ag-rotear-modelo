@@ -14,11 +14,34 @@ from urllib.parse import urlsplit
 
 from .contracts import Effort, Route
 from .model_registry import CatalogError, CatalogSnapshot, catalog_from_json
+from .portable_acl import ensure_private_descriptor, ensure_private_directory
+from .portable_fs import replace_file
 from .portable_flock import fcntl
 
 
 class RegistryError(ValueError):
     pass
+
+
+def _posix_runtime() -> bool:
+    return os.name == "posix"
+
+
+def _metadata_is_reparse_point(metadata) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+
+
+def _path_is_link_like(path: Path) -> bool:
+    try:
+        metadata = os.lstat(str(path))
+    except OSError:
+        return False
+    return stat.S_ISLNK(metadata.st_mode) or _metadata_is_reparse_point(metadata)
+
+
+def _set_private_descriptor_mode(descriptor: int, mode: int) -> None:
+    ensure_private_descriptor(descriptor, mode)
 
 
 _ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -805,6 +828,8 @@ def _registry_from_payload(value: Any) -> BenchmarkRegistry:
 
 
 def _fsync_directory(path: Path) -> None:
+    if not _posix_runtime():
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
@@ -850,7 +875,7 @@ def _mutation_lock_path(destination: Path) -> Path:
 def _acquire_mutation_lock(path: Path) -> int:
     descriptor = -1
     try:
-        if path.is_symlink():
+        if _path_is_link_like(path):
             raise RegistryError("benchmark mutation lock must not be a symlink")
         flags = os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
@@ -860,7 +885,7 @@ def _acquire_mutation_lock(path: Path) -> int:
             raise RegistryError(
                 "benchmark mutation lock must be a regular file"
             )
-        os.fchmod(descriptor, 0o600)
+        _set_private_descriptor_mode(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return descriptor
     except RegistryError:
@@ -919,7 +944,7 @@ def _prepare_temporary(destination: Path, payload: bytes) -> Path:
             dir=str(destination.parent),
         )
         temporary = Path(temporary_name)
-        os.fchmod(descriptor, 0o600)
+        _set_private_descriptor_mode(descriptor, 0o600)
         _write_all(descriptor, payload)
         _fsync_file(descriptor)
         os.close(descriptor)
@@ -939,7 +964,7 @@ def _replace_mutation_guard_phase(path: Path, payload: bytes) -> None:
             path,
             payload,
         )
-        os.replace(str(temporary), str(path))
+        replace_file(temporary, path)
         temporary = None
         _fsync_directory(path.parent)
     finally:
@@ -985,7 +1010,7 @@ def _rollback_registry_commit(
         else:
             if backup is None:
                 return False, backup
-            os.replace(str(backup), str(destination))
+            replace_file(backup, destination)
             backup = None
         _fsync_directory(destination.parent)
         if previous is None:
@@ -1017,12 +1042,13 @@ def promote_candidate(candidate_path: Path, destination_path: Path) -> None:
     try:
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if (
-            destination.parent.is_symlink()
-            or destination.is_symlink()
-            or guard.is_symlink()
-            or lock.is_symlink()
+            _path_is_link_like(destination.parent)
+            or _path_is_link_like(destination)
+            or _path_is_link_like(guard)
+            or _path_is_link_like(lock)
         ):
             raise RegistryError("benchmark destination must not be a symlink")
+        ensure_private_directory(destination.parent)
         lock_descriptor = _acquire_mutation_lock(lock)
         if guard.exists():
             if not _mutation_guard_is_confirmed(guard):
@@ -1061,7 +1087,7 @@ def promote_candidate(candidate_path: Path, destination_path: Path) -> None:
             _fsync_directory(destination.parent)
 
         temporary = _prepare_temporary(destination, payload)
-        os.replace(str(temporary), str(destination))
+        replace_file(temporary, destination)
         temporary = None
         try:
             _fsync_directory(destination.parent)

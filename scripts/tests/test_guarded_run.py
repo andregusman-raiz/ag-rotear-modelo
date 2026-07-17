@@ -3,18 +3,20 @@ import hashlib
 import importlib.util
 import json
 import os
-import selectors
-import shlex
+import queue
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+from platform_support import FILE_SYMLINK_AVAILABLE, POSIX, WINDOWS
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -68,23 +70,30 @@ class GuardedRunTests(unittest.TestCase):
         self.capture.mkdir()
 
     def _launcher(self, exit_code=0):
-        launcher = self.root / ("launcher-%d.sh" % exit_code)
+        launcher = self.root / ("launcher-%d.py" % exit_code)
         stdin_path = self.capture / "stdin.bin"
         argv_path = self.capture / "argv.txt"
         env_path = self.capture / "env.txt"
         eof_path = self.capture / "eof.txt"
         launcher.write_text(
-            "#!/bin/sh\n"
-            "cat > %s\n" % shlex.quote(str(stdin_path))
-            + "printf '%%s\\n' \"$@\" > %s\n" % shlex.quote(str(argv_path))
-            + "env > %s\n" % shlex.quote(str(env_path))
-            + "printf 'eof\\n' > %s\n" % shlex.quote(str(eof_path))
-            + "printf 'child-out\\n'\n"
-            + "printf 'child-err\\n' >&2\n"
-            + "exit %d\n" % exit_code,
+            "import os\n"
+            "import pathlib\n"
+            "import sys\n"
+            "pathlib.Path(%r).write_bytes(sys.stdin.buffer.read())\n"
+            % str(stdin_path)
+            + "pathlib.Path(%r).write_text('\\n'.join(sys.argv[1:]) + '\\n', encoding='utf-8')\n"
+            % str(argv_path)
+            + "pathlib.Path(%r).write_text('\\n'.join('%%s=%%s' %% item for item in sorted(os.environ.items())) + '\\n', encoding='utf-8')\n"
+            % str(env_path)
+            + "pathlib.Path(%r).write_text('eof\\n', encoding='utf-8')\n"
+            % str(eof_path)
+            + "print('child-out')\n"
+            + "print('child-err', file=sys.stderr)\n"
+            + "raise SystemExit(%d)\n" % exit_code,
             encoding="utf-8",
         )
-        launcher.chmod(0o700)
+        if os.name == "posix":
+            launcher.chmod(0o700)
         return launcher
 
     def _blocking_launcher(self):
@@ -280,61 +289,106 @@ class GuardedRunTests(unittest.TestCase):
         ready_path = input_dir / "READY"
         request_path.write_bytes(request)
         task_path.write_bytes(task)
-        request_path.chmod(0o600)
-        task_path.chmod(0o600)
+        if os.name == "posix":
+            request_path.chmod(0o600)
+            task_path.chmod(0o600)
         ready_path.write_bytes(cls._manifest_bytes(request, task, nonce))
-        ready_path.chmod(0o600)
+        if os.name == "posix":
+            ready_path.chmod(0o600)
 
-    def _start(self, *, exit_code=0, prepare_timeout=2.0, launcher=None):
+    @staticmethod
+    def _readline_with_timeout(stream, timeout):
+        result = queue.Queue(maxsize=1)
+
+        def read_line():
+            try:
+                result.put((True, stream.readline()))
+            except BaseException as error:
+                result.put((False, error))
+
+        threading.Thread(target=read_line, daemon=True).start()
+        try:
+            succeeded, value = result.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError("stream did not produce a line") from None
+        if not succeeded:
+            raise value
+        return value
+
+    def _start(
+        self,
+        *,
+        exit_code=0,
+        prepare_timeout=2.0,
+        launcher=None,
+        workdir=None,
+        private_temp_root=None,
+        env=None,
+    ):
+        active_workdir = Path(workdir or self.workdir)
+        active_temp_root = Path(private_temp_root or self.temp_root)
+        command = [
+            sys.executable,
+            str(GUARDIAN),
+            "--launcher",
+            str(launcher or self._launcher(exit_code)),
+            "--workdir",
+            str(active_workdir),
+            "--private-temp-root",
+            str(active_temp_root),
+            "--sandbox",
+            "read-only",
+            "--approval-policy",
+            "never",
+            "--prepare-timeout",
+            str(prepare_timeout),
+        ]
+        process_environment = {
+            **os.environ,
+            "TMPDIR": str(active_temp_root),
+            "TEMP": str(active_temp_root),
+            "TMP": str(active_temp_root),
+        }
+        if env:
+            process_environment.update(env)
+        process_options = {
+            "cwd": str(active_workdir),
+            "env": process_environment,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "bufsize": 1,
+        }
+        if os.name == "posix":
+            process_options["start_new_session"] = True
+        elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         process = subprocess.Popen(
-            [
-                sys.executable,
-                str(GUARDIAN),
-                "--launcher",
-                str(launcher or self._launcher(exit_code)),
-                "--workdir",
-                str(self.workdir),
-                "--sandbox",
-                "read-only",
-                "--approval-policy",
-                "never",
-                "--prepare-timeout",
-                str(prepare_timeout),
-            ],
-            cwd=str(self.workdir),
-            env={**os.environ, "TMPDIR": str(self.temp_root)},
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
+            command,
+            **process_options,
         )
         self.addCleanup(self._stop_if_running, process)
-        selector = selectors.DefaultSelector()
         try:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            self.assertTrue(selector.select(timeout=3), "guardian did not announce input")
-            line = process.stdout.readline()
-        finally:
-            selector.close()
+            line = self._readline_with_timeout(process.stdout, 3)
+        except TimeoutError:
+            self.fail("guardian did not announce input")
         if not line:
             self.fail(process.stderr.read())
         event = json.loads(line)
         self.assertEqual("input-ready", event["event"])
         self.assertRegex(event["ready_nonce"], r"^[0-9a-f]{64}$")
         input_dir = Path(event["input_dir"])
-        self.assertEqual(0o700, stat.S_IMODE(input_dir.stat().st_mode))
-        self.assertFalse(input_dir.is_relative_to(self.workdir))
+        if os.name == "posix":
+            self.assertEqual(0o700, stat.S_IMODE(input_dir.stat().st_mode))
+        self.assertFalse(input_dir.is_relative_to(active_workdir))
+        self.assertTrue(input_dir.is_relative_to(active_temp_root))
         return process, event, input_dir
 
     def _read_stdout_line(self, process):
-        selector = selectors.DefaultSelector()
         try:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            self.assertTrue(selector.select(timeout=3), "child did not announce readiness")
-            return process.stdout.readline()
-        finally:
-            selector.close()
+            return self._readline_with_timeout(process.stdout, 3)
+        except TimeoutError:
+            self.fail("child did not announce readiness")
 
     @staticmethod
     def _stop_if_running(process):
@@ -406,6 +460,7 @@ class GuardedRunTests(unittest.TestCase):
         self.assertNotIn(task.decode("utf-8").strip(), stdout)
         self.assertFalse(input_dir.exists())
 
+    @unittest.skipUnless(POSIX, "POSIX hard-link publication only")
     def test_publisher_rolls_back_ready_if_link_reports_failure_after_creation(self):
         spec = importlib.util.spec_from_file_location("guarded_run", GUARDIAN)
         module = importlib.util.module_from_spec(spec)
@@ -433,6 +488,7 @@ class GuardedRunTests(unittest.TestCase):
             {entry.name for entry in input_dir.iterdir()},
         )
 
+    @unittest.skipUnless(POSIX, "POSIX descriptor durability only")
     def test_publisher_has_no_reportable_failure_after_visibility_commit(self):
         spec = importlib.util.spec_from_file_location("guarded_run", GUARDIAN)
         module = importlib.util.module_from_spec(spec)
@@ -498,6 +554,30 @@ class GuardedRunTests(unittest.TestCase):
                 tempfile.tempdir = None
 
         self.assertEqual([], list(nested_tmp.glob("ag-model-router.*")))
+
+    def test_explicit_private_temp_root_overrides_nested_system_temp(self):
+        workspace = self.root / "broad-workspace"
+        nested_temp = workspace / "AppData" / "Local" / "Temp"
+        private_temp = self.root / "external-private-temp"
+        nested_temp.mkdir(parents=True)
+        private_temp.mkdir()
+
+        process, event, input_dir = self._start(
+            workdir=workspace,
+            private_temp_root=private_temp,
+            env={
+                "TMPDIR": str(nested_temp),
+                "TEMP": str(nested_temp),
+                "TMP": str(nested_temp),
+            },
+        )
+        self._write_inputs(input_dir, event["ready_nonce"])
+        process.communicate(timeout=5)
+
+        self.assertEqual(0, process.returncode)
+        self.assertTrue(input_dir.is_relative_to(private_temp))
+        self.assertFalse(input_dir.is_relative_to(workspace))
+        self.assertFalse(input_dir.exists())
 
     @unittest.skipUnless(os.name == "posix", "POSIX pipe metadata only")
     def test_task_snapshot_is_immutable_after_ready_and_uses_pipe_stdin(self):
@@ -609,16 +689,27 @@ class GuardedRunTests(unittest.TestCase):
                 input_dir = self.root / ("manifest-input-" + label)
                 input_dir.mkdir(mode=0o700)
                 self._write_manifest_inputs(input_dir, nonce, request, task)
-                descriptor = os.open(input_dir, module._open_directory_flags())
-                try:
-                    self.assertTrue(module._ready_exists(descriptor))
-                    target = input_dir / (label + (".json" if label == "request" else ".txt"))
+                if POSIX:
+                    descriptor = os.open(input_dir, module._open_directory_flags())
+                    try:
+                        self.assertTrue(module._ready_exists(descriptor))
+                        target = input_dir / (
+                            label + (".json" if label == "request" else ".txt")
+                        )
+                        target.write_bytes(b"x" * target.stat().st_size)
+                        target.chmod(0o600)
+                        with self.assertRaises(module.GuardianError):
+                            module._validate_inputs(descriptor, nonce)
+                    finally:
+                        os.close(descriptor)
+                else:
+                    self.assertTrue(module._ready_exists_path(input_dir))
+                    target = input_dir / (
+                        label + (".json" if label == "request" else ".txt")
+                    )
                     target.write_bytes(b"x" * target.stat().st_size)
-                    target.chmod(0o600)
                     with self.assertRaises(module.GuardianError):
-                        module._validate_inputs(descriptor, nonce)
-                finally:
-                    os.close(descriptor)
+                        module._validate_inputs_path(input_dir, nonce)
 
     def test_ready_manifest_parser_is_strict_canonical_and_bounded(self):
         spec = importlib.util.spec_from_file_location("guarded_run", GUARDIAN)
@@ -656,6 +747,7 @@ class GuardedRunTests(unittest.TestCase):
             with self.subTest(case=case), self.assertRaises(module.GuardianError):
                 module._parse_ready_manifest(document, nonce)
 
+    @unittest.skipUnless(POSIX, "POSIX anonymous request descriptor only")
     def test_request_snapshot_uses_anonymous_fd_after_child_start(self):
         request = b'{"request":"original"}\n'
         task = b"original task\n"
@@ -680,6 +772,32 @@ class GuardedRunTests(unittest.TestCase):
         self.assertEqual(task, task_capture.read_bytes())
         self.assertEqual(b"x" * len(request), replacement.read_bytes())
 
+    @unittest.skipUnless(WINDOWS, "Windows private request path only")
+    def test_windows_request_snapshot_uses_same_private_temp_root(self):
+        request = b'{"request":"windows"}\n'
+        task = b"windows task\n"
+        launcher, request_capture, task_capture, argv_capture, release = (
+            self._request_fd_launcher("windows-private-root")
+        )
+        process, event, input_dir = self._start(launcher=launcher)
+        self._write_manifest_inputs(input_dir, event["ready_nonce"], request, task)
+        self.assertEqual("child-start\n", self._read_stdout_line(process))
+
+        argv = argv_capture.read_text(encoding="utf-8").splitlines()
+        request_index = argv.index("--request")
+        snapshot_path = Path(argv[request_index + 1])
+        self.assertTrue(snapshot_path.is_relative_to(self.temp_root))
+        self.assertEqual(request, snapshot_path.read_bytes())
+
+        release.write_text("release\n", encoding="utf-8")
+        process.communicate(timeout=5)
+
+        self.assertEqual(0, process.returncode)
+        self.assertEqual(request, request_capture.read_bytes())
+        self.assertEqual(task, task_capture.read_bytes())
+        self.assertFalse(snapshot_path.exists())
+
+    @unittest.skipUnless(POSIX, "POSIX directory descriptor binding only")
     def test_directory_replacement_preserves_sentinel_and_scrubs_original(self):
         request = b'{"request":"bound-original"}\n'
         task = b"bound original task\n"
@@ -722,6 +840,7 @@ class GuardedRunTests(unittest.TestCase):
         self.assertEqual(7, process.returncode)
         self.assertFalse(input_dir.exists())
 
+    @unittest.skipUnless(POSIX, "POSIX signal semantics only")
     def test_signal_during_preparation_cleans_without_starting_child(self):
         handled = tuple(
             getattr(signal, name)
@@ -739,6 +858,7 @@ class GuardedRunTests(unittest.TestCase):
                 self.assertFalse(input_dir.exists())
                 self.assertFalse((self.capture / "stdin.bin").exists())
 
+    @unittest.skipUnless(POSIX, "POSIX signal semantics only")
     def test_event_pid_can_cancel_preparation_and_cleanup(self):
         process, event, input_dir = self._start(prepare_timeout=5)
 
@@ -835,15 +955,16 @@ class GuardedRunTests(unittest.TestCase):
 
     def test_invalid_inputs_fail_closed_preserve_external_target_and_clean(self):
         cases = [
-            "request-mode",
-            "ready-mode",
-            "task-symlink",
             "request-limit",
             "task-limit",
             "extra-entry",
             "missing-task",
         ]
-        if hasattr(os, "mkfifo"):
+        if POSIX:
+            cases.extend(("request-mode", "ready-mode"))
+        if FILE_SYMLINK_AVAILABLE:
+            cases.append("task-symlink")
+        if POSIX and hasattr(os, "mkfifo"):
             cases.append("request-fifo")
         for case in cases:
             with self.subTest(case=case):
@@ -886,6 +1007,7 @@ class GuardedRunTests(unittest.TestCase):
                 self.assertEqual(b"preserve", external.read_bytes())
                 self.assertFalse((self.capture / "stdin.bin").exists())
 
+    @unittest.skipUnless(POSIX, "POSIX ownership only")
     def test_owner_validation_rejects_unexpected_uid(self):
         spec = importlib.util.spec_from_file_location("guarded_run", GUARDIAN)
         module = importlib.util.module_from_spec(spec)
@@ -904,6 +1026,7 @@ class GuardedRunTests(unittest.TestCase):
                     MAX_INPUT_BYTES,
                 )
 
+    @unittest.skipUnless(POSIX, "POSIX nonblocking file flags only")
     def test_special_input_open_is_nonblocking_before_regular_file_validation(self):
         spec = importlib.util.spec_from_file_location("guarded_run", GUARDIAN)
         module = importlib.util.module_from_spec(spec)
@@ -917,7 +1040,8 @@ class GuardedRunTests(unittest.TestCase):
                 source = script.read_text(encoding="utf-8")
                 ast.parse(source, filename=str(script), feature_version=(3, 9))
                 self.assertNotIn("shell=True", source)
-                self.assertTrue(script.stat().st_mode & stat.S_IXUSR)
+                if POSIX:
+                    self.assertTrue(script.stat().st_mode & stat.S_IXUSR)
 
 
 if __name__ == "__main__":

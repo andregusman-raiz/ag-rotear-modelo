@@ -17,6 +17,9 @@ import time
 from pathlib import Path
 from typing import List, Optional, Sequence, Set, Tuple
 
+from model_router.portable_acl import ensure_private_directory, ensure_private_file
+from model_router.portable_fs import replace_file
+
 
 PROTOCOL = "ag-model-router-guardian/v1"
 READY_PROTOCOL = "ag-model-router-ready/v1"
@@ -39,6 +42,7 @@ CONTROL_FD_ENV = "AG_MODEL_ROUTER_CONTROL_FD"
 CONTROL_RECORD_MAX_BYTES = 4096
 CONTROL_MAX_GROUPS = 16
 CONTROL_POLL_SECONDS = 0.02
+PRIVATE_TEMP_ROOT_ENV = "AG_MODEL_ROUTER_PRIVATE_TEMP_ROOT"
 
 
 def _posix_runtime() -> bool:
@@ -157,17 +161,107 @@ def _directory_identity(metadata) -> Tuple[int, int]:
     return (metadata.st_dev, metadata.st_ino)
 
 
+def _metadata_is_reparse_point(metadata) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return bool(attributes & reparse_flag)
+
+
+def _path_is_link_like(path: Path) -> bool:
+    try:
+        metadata = os.lstat(str(path))
+    except OSError:
+        return False
+    return stat.S_ISLNK(metadata.st_mode) or _metadata_is_reparse_point(metadata)
+
+
+def _validate_path_components(path: Path) -> None:
+    components = []
+    current = path
+    while current != current.parent:
+        components.append(current)
+        current = current.parent
+    for component in reversed(components):
+        if component.exists() and _path_is_link_like(component):
+            raise GuardianError("private temp root must not use links")
+
+
+def _configured_private_temp_root() -> Optional[Path]:
+    value = os.environ.get(PRIVATE_TEMP_ROOT_ENV)
+    if value is None or not value.strip():
+        return None
+    return Path(value)
+
+
+def _default_private_temp_root() -> Path:
+    user_id = _current_uid()
+    if user_id is None:
+        identity = (
+            os.environ.get("USERNAME")
+            or os.environ.get("USERPROFILE")
+            or "windows-user"
+        )
+        suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    else:
+        suffix = str(user_id)
+    return Path(tempfile.gettempdir()) / (
+        "ag-model-router-private-" + suffix
+    )
+
+
+def _resolve_private_temp_root(
+    workdir: Path,
+    configured: Optional[Path],
+) -> Path:
+    candidate = (
+        configured
+        if configured is not None
+        else _default_private_temp_root()
+    )
+    if not candidate.is_absolute():
+        raise GuardianError("private temp root must be absolute")
+    candidate = Path(os.path.abspath(str(candidate)))
+    try:
+        candidate.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if _windows_runtime():
+            _validate_path_components(candidate)
+        elif _path_is_link_like(candidate):
+            raise GuardianError("private temp root must not use links")
+        metadata = os.lstat(str(candidate))
+    except GuardianError:
+        raise
+    except OSError:
+        raise GuardianError("private temp root is unavailable") from None
+    if not stat.S_ISDIR(metadata.st_mode) or _metadata_is_reparse_point(metadata):
+        raise GuardianError("private temp root is invalid")
+    if _is_within(candidate, workdir):
+        raise GuardianError("private temp root must be outside workdir")
+    try:
+        ensure_private_directory(candidate)
+    except OSError:
+        raise GuardianError("private temp root could not be secured") from None
+    return candidate
+
+
 def _create_input_directory(
     workdir: Path,
+    private_temp_root: Optional[Path] = None,
 ) -> Tuple[Path, int, int, str, Tuple[int, int]]:
-    input_dir = Path(tempfile.mkdtemp(prefix="ag-model-router."))
+    if private_temp_root is None:
+        private_temp_root = _resolve_private_temp_root(workdir, None)
+    input_dir = Path(
+        tempfile.mkdtemp(
+            prefix="ag-model-router.",
+            dir=str(private_temp_root),
+        )
+    )
     descriptor = -1
     parent_descriptor = -1
     try:
         if _is_within(input_dir, workdir):
             os.rmdir(str(input_dir))
             raise GuardianError("input directory must be outside workdir")
-        os.chmod(str(input_dir), 0o700)
+        ensure_private_directory(input_dir)
         parent_descriptor = os.open(
             str(input_dir.parent),
             _open_directory_flags(),
@@ -206,14 +300,22 @@ def _create_input_directory(
         raise
 
 
-def _create_input_directory_path(workdir: Path) -> Tuple[Path, Tuple[int, int]]:
-    input_dir = Path(tempfile.mkdtemp(prefix="ag-model-router."))
+def _create_input_directory_path(
+    workdir: Path,
+    private_temp_root: Path,
+) -> Tuple[Path, Tuple[int, int]]:
+    input_dir = Path(
+        tempfile.mkdtemp(
+            prefix="ag-model-router.",
+            dir=str(private_temp_root),
+        )
+    )
     try:
         if _is_within(input_dir, workdir):
             os.rmdir(str(input_dir))
             raise GuardianError("input directory must be outside workdir")
-        os.chmod(str(input_dir), 0o700)
-        metadata = input_dir.stat(follow_symlinks=False)
+        ensure_private_directory(input_dir)
+        metadata = os.stat(str(input_dir), follow_symlinks=False)
         if not stat.S_ISDIR(metadata.st_mode):
             raise GuardianError("input directory is invalid")
         return input_dir, _directory_identity(metadata)
@@ -516,7 +618,7 @@ def _open_input_path(input_dir: Path, name: str, limit: int) -> int:
     path = input_dir / name
     opened = -1
     try:
-        if path.is_symlink():
+        if _path_is_link_like(path):
             raise GuardianError("router input is invalid")
         opened = os.open(str(path), _open_regular_flags())
         _validate_private_regular_metadata(os.fstat(opened), name, limit)
@@ -537,7 +639,7 @@ def _ready_exists_path(input_dir: Path) -> bool:
     ready_path = input_dir / READY_NAME
     if not ready_path.exists():
         return False
-    if ready_path.is_symlink():
+    if _path_is_link_like(ready_path):
         raise GuardianError("READY marker is invalid")
     return True
 
@@ -629,9 +731,33 @@ def _scrub_directory(descriptor: int) -> bool:
         return False
 
 
-def _scrub_directory_path(input_dir: Path) -> bool:
+def _directory_path_matches(
+    input_dir: Path,
+    identity: Tuple[int, int],
+) -> bool:
+    try:
+        metadata = os.stat(str(input_dir), follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and not _metadata_is_reparse_point(metadata)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and _directory_identity(metadata) == identity
+    )
+
+
+def _scrub_directory_path(
+    input_dir: Path,
+    expected_identity: Optional[Tuple[int, int]] = None,
+) -> bool:
     clean = True
     for _attempt in range(CLEANUP_PASSES):
+        if expected_identity is not None and not _directory_path_matches(
+            input_dir,
+            expected_identity,
+        ):
+            return False
         try:
             entries = tuple(input_dir.iterdir())
         except OSError:
@@ -640,8 +766,13 @@ def _scrub_directory_path(input_dir: Path) -> bool:
             return clean
         removed_any = False
         for entry in entries:
+            if expected_identity is not None and not _directory_path_matches(
+                input_dir,
+                expected_identity,
+            ):
+                return False
             try:
-                metadata = entry.stat(follow_symlinks=False)
+                metadata = os.stat(str(entry), follow_symlinks=False)
                 if stat.S_ISDIR(metadata.st_mode):
                     clean = False
                     continue
@@ -657,6 +788,13 @@ def _scrub_directory_path(input_dir: Path) -> bool:
         return clean and not tuple(input_dir.iterdir())
     except OSError:
         return False
+
+
+def _scrub_bound_directory_path(
+    input_dir: Path,
+    identity: Tuple[int, int],
+) -> bool:
+    return _scrub_directory_path(input_dir, expected_identity=identity)
 
 
 def _remove_bound_directory(
@@ -683,10 +821,14 @@ def _remove_bound_directory(
 
 def _remove_path_directory(input_dir: Path, identity: Tuple[int, int]) -> bool:
     try:
-        linked = input_dir.stat(follow_symlinks=False)
+        linked = os.stat(str(input_dir), follow_symlinks=False)
     except OSError:
         return False
-    if not stat.S_ISDIR(linked.st_mode) or _directory_identity(linked) != identity:
+    if (
+        not stat.S_ISDIR(linked.st_mode)
+        or _metadata_is_reparse_point(linked)
+        or _directory_identity(linked) != identity
+    ):
         return False
     try:
         input_dir.rmdir()
@@ -801,7 +943,7 @@ def publish_ready(input_dir: Path, nonce: str) -> None:
 
 
 def _publish_ready_path(input_dir: Path, nonce: str) -> None:
-    if input_dir.is_symlink() or not input_dir.is_dir():
+    if _path_is_link_like(input_dir) or not input_dir.is_dir():
         raise GuardianError("READY publication input is invalid")
     staged_path = input_dir / READY_STAGING_NAME
     ready_path = input_dir / READY_NAME
@@ -829,7 +971,8 @@ def _publish_ready_path(input_dir: Path, nonce: str) -> None:
         os.fsync(staged)
         os.close(staged)
         staged = -1
-        os.replace(str(staged_path), str(ready_path))
+        ensure_private_file(staged_path)
+        replace_file(staged_path, ready_path)
         published = True
     except GuardianError:
         raise
@@ -1022,10 +1165,13 @@ def _child_environment(control_write_descriptor: int = -1) -> dict:
     return environment
 
 
-def _anonymous_request_file(snapshot: bytes):
+def _anonymous_request_file(snapshot: bytes, private_temp_root: Path):
     if not _posix_runtime():
         raise GuardianError("anonymous request transport requires POSIX")
-    handle = tempfile.TemporaryFile(mode="w+b")
+    handle = tempfile.TemporaryFile(
+        mode="w+b",
+        dir=str(private_temp_root),
+    )
     try:
         handle.write(snapshot)
         handle.flush()
@@ -1069,9 +1215,12 @@ class _RequestTransport:
             self.path = None
 
 
-def _request_transport(snapshot: bytes) -> _RequestTransport:
+def _request_transport(
+    snapshot: bytes,
+    private_temp_root: Path,
+) -> _RequestTransport:
     if _posix_runtime():
-        handle = _anonymous_request_file(snapshot)
+        handle = _anonymous_request_file(snapshot, private_temp_root)
         descriptor = handle.fileno()
         return _RequestTransport(
             ["--request-fd", str(descriptor)],
@@ -1084,13 +1233,14 @@ def _request_transport(snapshot: bytes) -> _RequestTransport:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix="ag-model-router-request-",
             suffix=".json",
+            dir=str(private_temp_root),
         )
         path = Path(temporary_name)
-        os.chmod(str(path), 0o600)
         _write_all(descriptor, snapshot)
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
+        ensure_private_file(path)
         return _RequestTransport(["--request", str(path)], path=path)
     except Exception:
         if descriptor >= 0:
@@ -1136,6 +1286,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=_default_launcher(),
     )
     parser.add_argument("--workdir", type=Path, required=True)
+    parser.add_argument(
+        "--private-temp-root",
+        type=Path,
+        default=_configured_private_temp_root(),
+    )
     parser.add_argument(
         "--sandbox",
         required=True,
@@ -1190,7 +1345,14 @@ def _run_path_lifecycle(args, handled_signals: Sequence[int]) -> int:
     try:
         args.launcher = _validate_launcher(args.launcher)
         args.workdir = _validate_workdir(args.workdir)
-        input_dir, directory_identity = _create_input_directory_path(args.workdir)
+        args.private_temp_root = _resolve_private_temp_root(
+            args.workdir,
+            args.private_temp_root,
+        )
+        input_dir, directory_identity = _create_input_directory_path(
+            args.workdir,
+            args.private_temp_root,
+        )
         ready_nonce = secrets.token_hex(NONCE_HEX_LENGTH // 2)
         event = {
             "event": "input-ready",
@@ -1209,12 +1371,15 @@ def _run_path_lifecycle(args, handled_signals: Sequence[int]) -> int:
             input_dir,
             ready_nonce,
         )
-        if not _scrub_directory_path(input_dir):
+        if not _scrub_bound_directory_path(input_dir, directory_identity):
             raise GuardianError("input directory cleanup failed")
         directory_removed = _remove_path_directory(input_dir, directory_identity)
         if not directory_removed:
             raise GuardianError("input directory identity changed")
-        request_transport = _request_transport(request_snapshot)
+        request_transport = _request_transport(
+            request_snapshot,
+            args.private_temp_root,
+        )
         deferred_signals: List[int] = []
         spawn_error: Optional[BaseException] = None
 
@@ -1260,7 +1425,10 @@ def _run_path_lifecycle(args, handled_signals: Sequence[int]) -> int:
         if request_transport is not None:
             request_transport.close()
         if input_dir is not None and not directory_removed:
-            if _scrub_directory_path(input_dir) and directory_identity is not None:
+            if (
+                directory_identity is not None
+                and _scrub_bound_directory_path(input_dir, directory_identity)
+            ):
                 directory_removed = _remove_path_directory(
                     input_dir,
                     directory_identity,
@@ -1294,13 +1462,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         args.launcher = _validate_launcher(args.launcher)
         args.workdir = _validate_workdir(args.workdir)
+        args.private_temp_root = _resolve_private_temp_root(
+            args.workdir,
+            args.private_temp_root,
+        )
         (
             input_dir,
             directory_descriptor,
             parent_descriptor,
             directory_basename,
             directory_identity,
-        ) = _create_input_directory(args.workdir)
+        ) = _create_input_directory(args.workdir, args.private_temp_root)
         ready_nonce = secrets.token_hex(NONCE_HEX_LENGTH // 2)
         event = {
             "event": "input-ready",
@@ -1328,7 +1500,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cleanup_binding_failed = not directory_removed
         if cleanup_binding_failed:
             raise GuardianError("input directory identity changed")
-        request_transport = _request_transport(request_snapshot)
+        request_transport = _request_transport(
+            request_snapshot,
+            args.private_temp_root,
+        )
         control_read_descriptor, control_write_descriptor = _open_control_pipe()
         deferred_signals: List[int] = []
         spawn_error: Optional[BaseException] = None

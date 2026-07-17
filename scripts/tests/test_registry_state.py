@@ -16,6 +16,11 @@ from pathlib import Path
 from unittest import mock
 
 from jsonschema import Draft202012Validator, FormatChecker
+from platform_support import (
+    DIRECTORY_SYMLINK_AVAILABLE,
+    FILE_SYMLINK_AVAILABLE,
+    POSIX,
+)
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 SKILL_ROOT = SCRIPTS.parent
@@ -520,15 +525,15 @@ print('stdlib-operational-ok')
             runtime = RuntimeState(Path(tmp), seed_root=REFERENCES)
             runtime.bootstrap()
             before = runtime.benchmark_registry_path.read_bytes()
-            real_replace = registry_module.os.replace
+            real_replace = registry_module.replace_file
 
-            def fail_destination_replace(source, destination):
+            def fail_destination_replace(source, destination, **kwargs):
                 if Path(destination) == runtime.benchmark_registry_path:
                     raise OSError("replace failure")
-                return real_replace(source, destination)
+                return real_replace(source, destination, **kwargs)
 
             with mock.patch(
-                "model_router.registry.os.replace",
+                "model_router.registry.replace_file",
                 side_effect=fail_destination_replace,
             ):
                 with self.assertRaises(RegistryError):
@@ -545,7 +550,10 @@ print('stdlib-operational-ok')
             b"outcome-confirmed\n",
             b"commit-outcome-unknown\n",
         }
-        for stage in ("fchmod", "write", "file-fsync"):
+        stages = ["write", "file-fsync"]
+        if POSIX:
+            stages.insert(0, "fchmod")
+        for stage in stages:
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
                 runtime = RuntimeState(Path(tmp), seed_root=REFERENCES)
                 runtime.bootstrap()
@@ -820,7 +828,7 @@ print('stdlib-operational-ok')
             ):
                 promote_candidate(candidate, runtime.benchmark_registry_path)
 
-    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    @unittest.skipUnless(FILE_SYMLINK_AVAILABLE, "file symlinks unavailable")
     def test_promotion_rejects_symlink_destination(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp, "target.json")
@@ -831,7 +839,7 @@ print('stdlib-operational-ok')
                 promote_candidate(SEED, link)
             self.assertEqual(SEED.read_bytes(), target.read_bytes())
 
-    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    @unittest.skipUnless(FILE_SYMLINK_AVAILABLE, "file symlinks unavailable")
     def test_promotion_rejects_symlink_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             candidate = Path(tmp, "candidate.json")
@@ -1194,6 +1202,7 @@ class RuntimeStateTests(unittest.TestCase):
                 state_a.read_decision(decision.parent.name)["status"],
             )
 
+    @unittest.skipUnless(POSIX, "POSIX hard-link key publication only")
     def test_key_publication_fault_never_exposes_a_partial_destination(self):
         import model_router.state as state_module
 
@@ -1251,6 +1260,7 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertFalse(orphan.exists())
             self.assertEqual(32, len(fresh.decision_key_path.read_bytes()))
 
+    @unittest.skipUnless(POSIX, "POSIX descriptor durability only")
     def test_key_publication_observes_file_and_root_fsync_order(self):
         import model_router.state as state_module
 
@@ -1349,6 +1359,7 @@ class RuntimeStateTests(unittest.TestCase):
                 runtime.bootstrap()
                 self.assertEqual(32, len(runtime.decision_key_path.read_bytes()))
 
+    @unittest.skipUnless(POSIX, "POSIX descriptor durability only")
     def test_root_fsync_faults_after_link_and_unlink_preserve_published_key(self):
         import model_router.state as state_module
 
@@ -1430,6 +1441,7 @@ class RuntimeStateTests(unittest.TestCase):
                     list(runtime.root.glob(".decision-hmac-key.tmp-*")),
                 )
 
+    @unittest.skipUnless(FILE_SYMLINK_AVAILABLE, "file symlinks unavailable")
     def test_orphan_cleanup_runs_under_key_lock_and_preserves_unrelated_targets(self):
         import model_router.state as state_module
 
@@ -1493,6 +1505,7 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertEqual(b"keep", unrelated.read_bytes())
             self.assertEqual(b"external", external.read_bytes())
 
+    @unittest.skipUnless(POSIX, "POSIX ownership and modes only")
     def test_audit_rejects_integrity_key_that_lost_private_mode(self):
         import model_router.state as state_module
         from support import passing_report, run_args, service_fixture
@@ -1523,7 +1536,7 @@ class RuntimeStateTests(unittest.TestCase):
             ), self.assertRaises(StateError):
                 service.state.read_decision(result.decision_path.parent.name)
 
-    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    @unittest.skipUnless(DIRECTORY_SYMLINK_AVAILABLE, "directory symlinks unavailable")
     def test_read_decision_rejects_hostile_ids_symlinks_and_tampering(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RuntimeState(Path(tmp), seed_root=REFERENCES)
@@ -1612,7 +1625,7 @@ class RuntimeStateTests(unittest.TestCase):
         with self.assertRaises(StateError):
             service.state.read_decision(result.decision_path.parent.name)
 
-    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    @unittest.skipUnless(DIRECTORY_SYMLINK_AVAILABLE, "directory symlinks unavailable")
     def test_read_decision_rejects_runtime_root_replacement(self):
         with tempfile.TemporaryDirectory() as tmp:
             parent = Path(tmp)
@@ -2170,13 +2183,15 @@ class RuntimeStateTests(unittest.TestCase):
             runtime.bootstrap()
             lock_path = root / ".runtime-mutation.lock"
             script = """
-import fcntl
 import os
+import sys
+sys.path.insert(0, %r)
+from model_router.portable_flock import fcntl
 path = %r
 descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
 fcntl.flock(descriptor, fcntl.LOCK_EX)
 os._exit(0)
-""" % str(lock_path)
+""" % (str(SCRIPTS), str(lock_path))
             completed = subprocess.run(
                 [sys.executable, "-c", script],
                 capture_output=True,
@@ -2202,8 +2217,10 @@ os._exit(0)
             lock_path = root / ".runtime-mutation.lock"
             witness_path = root / ".mutation-in-progress"
             script = """
-import fcntl
 import os
+import sys
+sys.path.insert(0, %r)
+from model_router.portable_flock import fcntl
 lock_path = %r
 witness_path = %r
 descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -2212,11 +2229,12 @@ witness = os.open(witness_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
 os.write(witness, b'mutation-in-progress\\n')
 os.fsync(witness)
 os.close(witness)
-directory = os.open(os.path.dirname(witness_path), os.O_RDONLY)
-os.fsync(directory)
-os.close(directory)
+if os.name == 'posix':
+    directory = os.open(os.path.dirname(witness_path), os.O_RDONLY)
+    os.fsync(directory)
+    os.close(directory)
 os._exit(0)
-""" % (str(lock_path), str(witness_path))
+""" % (str(SCRIPTS), str(lock_path), str(witness_path))
             completed = subprocess.run(
                 [sys.executable, "-c", script],
                 capture_output=True,
@@ -2408,19 +2426,22 @@ os._exit(0)
         import model_router.state as state_module
 
         real_prepare = state_module._prepare_decision_file
-        real_replace = state_module.os.replace
-        for stage in ("fchmod", "write", "file-fsync", "replace"):
+        real_replace = state_module.replace_file
+        stages = ["write", "file-fsync", "replace"]
+        if POSIX:
+            stages.insert(0, "fchmod")
+        for stage in stages:
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
                 runtime = RuntimeState(Path(tmp), seed_root=REFERENCES)
                 runtime.bootstrap()
                 if stage == "replace":
-                    def fail_decision_replace(source, destination):
+                    def fail_decision_replace(source, destination, **kwargs):
                         if Path(destination).name == "decision.json":
                             raise OSError("replace failure")
-                        return real_replace(source, destination)
+                        return real_replace(source, destination, **kwargs)
 
                     patcher = mock.patch(
-                        "model_router.state.os.replace",
+                        "model_router.state.replace_file",
                         side_effect=fail_decision_replace,
                     )
                 else:
@@ -2515,7 +2536,7 @@ os._exit(0)
             with self.assertRaisesRegex(StateError, "commit-outcome-unknown"):
                 fresh.append_observation(observation_fixture())
 
-    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    @unittest.skipUnless(FILE_SYMLINK_AVAILABLE, "file symlinks unavailable")
     def test_runtime_rejects_symlinked_registry_salt_and_telemetry_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime = RuntimeState(Path(tmp, "runtime"), seed_root=REFERENCES)

@@ -2,6 +2,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import traceback
 import unittest
 from pathlib import Path
@@ -34,13 +35,15 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 class ExecutorTests(unittest.TestCase):
     def test_builds_exact_safe_argv_without_shell(self):
+        project = Path(tempfile.gettempdir()) / "project"
+        schema = Path(tempfile.gettempdir()) / "child-result-schema.json"
         argv = build_argv(
             codex_bin="codex",
-            cwd=Path("/tmp/project"),
+            cwd=project,
             route=Route("gpt-5.6-luna", Effort.MEDIUM),
             sandbox=SandboxMode.READ_ONLY,
             approval=ApprovalPolicy.NEVER,
-            schema_path=Path("/tmp/child-result-schema.json"),
+            schema_path=schema,
         )
 
         self.assertEqual(
@@ -55,7 +58,7 @@ class ExecutorTests(unittest.TestCase):
                 "--color",
                 "never",
                 "-C",
-                "/tmp/project",
+                str(project),
                 "-m",
                 "gpt-5.6-luna",
                 "-c",
@@ -65,7 +68,7 @@ class ExecutorTests(unittest.TestCase):
                 "-s",
                 "read-only",
                 "--output-schema",
-                "/tmp/child-result-schema.json",
+                str(schema),
                 "-",
             ],
             argv,
@@ -337,6 +340,31 @@ class ExecutorTests(unittest.TestCase):
 
         self.assertEqual("thread-failure", result.thread_id)
         self.assertEqual("codex-event", result.failure_kind)
+        self.assertIsNone(result.child_report)
+
+    def test_capacity_failure_event_is_sanitized_for_route_fallback(self):
+        lines = (
+            json.dumps(
+                {"type": "thread.started", "thread_id": "thread-capacity"}
+            ),
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {
+                        "message": (
+                            "Selected model is at capacity. "
+                            "Please try a different model."
+                        ),
+                        "type": "server_error",
+                    },
+                }
+            ),
+        )
+
+        result = parse_jsonl(lines)
+
+        self.assertEqual("capacity", result.failure_kind)
+        self.assertEqual("", result.stderr_summary)
         self.assertIsNone(result.child_report)
 
     def test_failure_event_invalidates_a_later_pass_report(self):
