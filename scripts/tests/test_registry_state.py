@@ -1481,9 +1481,9 @@ class RuntimeStateTests(unittest.TestCase):
                 return result
 
             def observe_unlink(name, *args, **kwargs):
-                if str(name).startswith(".decision-hmac-key.tmp-"):
+                if Path(name).name.startswith(".decision-hmac-key.tmp-"):
                     self.assertTrue(lock_held)
-                    removed.append(str(name))
+                    removed.append(Path(name).name)
                 return real_unlink(name, *args, **kwargs)
 
             with mock.patch.object(
