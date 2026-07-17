@@ -141,8 +141,10 @@ raise SystemExit(3)
             finally:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
+            lock_payload = lock_path.read_bytes()
 
         self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(b"", lock_payload)
 
     def test_windows_replace_uses_write_through_move(self):
         import model_router.portable_fs as portable_fs

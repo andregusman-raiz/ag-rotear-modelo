@@ -1532,7 +1532,7 @@ def _cleanup_decision_key_temporaries_path(root: Path) -> None:
             continue
         if not _path_is_link_like(candidate) and not candidate.is_file():
             raise StateError("decision integrity key temporary is invalid")
-        candidate.unlink()
+        os.unlink(str(candidate))
         removed = True
     if removed:
         _fsync_directory(root)
