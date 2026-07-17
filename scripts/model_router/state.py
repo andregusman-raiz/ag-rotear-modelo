@@ -7,6 +7,7 @@ import re
 import secrets
 import stat
 import tempfile
+import threading
 from collections.abc import Mapping as RuntimeMapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -200,6 +201,8 @@ _BUDGET_FIELDS = (
 )
 _MUTATION_IN_PROGRESS = b"mutation-in-progress\n"
 _MUTATION_OUTCOME_CONFIRMED = b"outcome-confirmed\n"
+_IN_PROCESS_LOCKS_GUARD = threading.Lock()
+_IN_PROCESS_LOCKS = {}
 
 
 @dataclass(frozen=True)
@@ -1643,6 +1646,16 @@ def _release_runtime_lock(descriptor: int) -> None:
         os.close(descriptor)
 
 
+def _in_process_lock(path: Path) -> threading.RLock:
+    key = str(Path(path).resolve(strict=False))
+    with _IN_PROCESS_LOCKS_GUARD:
+        lock = _IN_PROCESS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _IN_PROCESS_LOCKS[key] = lock
+        return lock
+
+
 def _create_runtime_witness(path: Path) -> None:
     _atomic_write_bytes(path, _MUTATION_IN_PROGRESS)
 
@@ -1825,24 +1838,25 @@ class RuntimeState:
         flags = _binary_flags(os.O_CREAT | os.O_RDWR)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(
-            str(self.salt_lock_path),
-            flags,
-            0o600,
-        )
-        try:
-            _set_private_descriptor_mode(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            if not self.salt_path.exists():
-                _atomic_write_bytes(self.salt_path, secrets.token_bytes(32))
-            salt = self.salt_path.read_bytes()
-            if len(salt) != 32:
-                raise StateError("project hash salt is invalid")
-            _set_private_path_mode(self.salt_path, 0o600)
-            return salt
-        finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+        with _in_process_lock(self.salt_lock_path):
+            descriptor = os.open(
+                str(self.salt_lock_path),
+                flags,
+                0o600,
+            )
+            try:
+                _set_private_descriptor_mode(descriptor, 0o600)
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                if not self.salt_path.exists():
+                    _atomic_write_bytes(self.salt_path, secrets.token_bytes(32))
+                salt = self.salt_path.read_bytes()
+                if len(salt) != 32:
+                    raise StateError("project hash salt is invalid")
+                _set_private_path_mode(self.salt_path, 0o600)
+                return salt
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
 
     def _ensure_decision_key(self) -> bytes:
         if not _posix_runtime():
@@ -2116,24 +2130,25 @@ class RuntimeState:
             flags = _binary_flags(os.O_WRONLY | os.O_CREAT | os.O_APPEND)
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            descriptor = os.open(
-                str(self.observations_path),
-                flags,
-                0o600,
-            )
-            try:
-                _set_private_descriptor_mode(descriptor, 0o600)
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
-                offset = 0
-                while offset < len(line):
-                    written = os.write(descriptor, line[offset:])
-                    if written <= 0:
-                        raise OSError("short telemetry write")
-                    offset += written
-                os.fsync(descriptor)
-            finally:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
+            with _in_process_lock(self.observations_path):
+                descriptor = os.open(
+                    str(self.observations_path),
+                    flags,
+                    0o600,
+                )
+                try:
+                    _set_private_descriptor_mode(descriptor, 0o600)
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                    offset = 0
+                    while offset < len(line):
+                        written = os.write(descriptor, line[offset:])
+                        if written <= 0:
+                            raise OSError("short telemetry write")
+                        offset += written
+                    os.fsync(descriptor)
+                finally:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
         except Exception:
             raise StateError("telemetry observation could not be written") from None
 
