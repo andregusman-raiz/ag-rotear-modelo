@@ -1,5 +1,4 @@
 import errno
-import fcntl
 import hashlib
 import hmac
 import json
@@ -18,6 +17,7 @@ from typing import Any, Mapping, Optional, Tuple
 
 from .contracts import Effort, FailureClass, Route
 from .profiles import ProfileError, load_profiles
+from .portable_flock import fcntl
 from .registry import (
     BenchmarkRegistry,
     RegistryError,

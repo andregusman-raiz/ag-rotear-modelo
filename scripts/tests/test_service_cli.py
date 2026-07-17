@@ -23,6 +23,7 @@ class ServiceCliTests(unittest.TestCase):
         for entrypoint in (
             "router.py",
             "run-route.sh",
+            "run-route.py",
             "guarded-run.py",
             "codex-child-supervisor.py",
             "publish-ready.py",

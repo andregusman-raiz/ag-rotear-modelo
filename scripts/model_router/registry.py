@@ -1,5 +1,4 @@
 import errno
-import fcntl
 import json
 import os
 import re
@@ -15,6 +14,7 @@ from urllib.parse import urlsplit
 
 from .contracts import Effort, Route
 from .model_registry import CatalogError, CatalogSnapshot, catalog_from_json
+from .portable_flock import fcntl
 
 
 class RegistryError(ValueError):

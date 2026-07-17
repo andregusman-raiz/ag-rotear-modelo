@@ -27,6 +27,14 @@ CHILD_SUPERVISOR = Path(__file__).resolve().parents[1] / "codex-child-supervisor
 EXECUTION_MODES = ("execute", "verify")
 
 
+def _posix_runtime():
+    return os.name == "posix"
+
+
+def _windows_runtime():
+    return os.name == "nt"
+
+
 class ExecutionBlocked(ValueError):
     pass
 
@@ -126,12 +134,29 @@ def _absolute_path(value, path):
 
 
 def _signal_process_tree(process, force):
-    if os.name == "posix":
+    if _posix_runtime():
         pid = getattr(process, "pid", None)
         if type(pid) is int and pid > 0:
             sent_signal = signal.SIGKILL if force else signal.SIGTERM
             try:
                 os.killpg(pid, sent_signal)
+                return
+            except OSError:
+                pass
+    elif _windows_runtime():
+        pid = getattr(process, "pid", None)
+        if type(pid) is int and pid > 0:
+            command = ["taskkill", "/PID", str(pid), "/T"]
+            if force:
+                command.append("/F")
+            try:
+                subprocess.run(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    shell=False,
+                )
                 return
             except OSError:
                 pass
@@ -143,7 +168,7 @@ def _signal_process_tree(process, force):
 
 
 def _guardian_control_fd():
-    if os.name != "posix":
+    if not _posix_runtime():
         return None
     value = os.environ.get(CONTROL_FD_ENV)
     if value is None:
@@ -554,7 +579,7 @@ class CodexExecutor:
             "text": True,
             "shell": False,
         }
-        if os.name == "posix":
+        if _posix_runtime():
             process_options["start_new_session"] = True
         control_fd = _guardian_control_fd()
         if control_fd is not None:

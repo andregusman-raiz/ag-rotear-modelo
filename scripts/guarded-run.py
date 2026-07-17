@@ -41,6 +41,14 @@ CONTROL_MAX_GROUPS = 16
 CONTROL_POLL_SECONDS = 0.02
 
 
+def _posix_runtime() -> bool:
+    return os.name == "posix"
+
+
+def _windows_runtime() -> bool:
+    return os.name == "nt"
+
+
 class GuardianError(ValueError):
     pass
 
@@ -99,7 +107,7 @@ def _validate_private_regular_metadata(
     expected_uid = _current_uid()
     if expected_uid is not None and metadata.st_uid != expected_uid:
         raise GuardianError("%s owner is invalid" % label)
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
+    if _posix_runtime() and stat.S_IMODE(metadata.st_mode) != 0o600:
         raise GuardianError("%s permissions are invalid" % label)
     if metadata.st_size < 0 or metadata.st_size > size_limit:
         raise GuardianError("%s exceeds its size limit" % label)
@@ -112,7 +120,7 @@ def _validate_private_directory(descriptor: int) -> None:
     expected_uid = _current_uid()
     if expected_uid is not None and metadata.st_uid != expected_uid:
         raise GuardianError("input directory owner is invalid")
-    if stat.S_IMODE(metadata.st_mode) != 0o700:
+    if _posix_runtime() and stat.S_IMODE(metadata.st_mode) != 0o700:
         raise GuardianError("input directory permissions are invalid")
 
 
@@ -132,7 +140,9 @@ def _validate_launcher(path: Path) -> Path:
         metadata = os.stat(str(path), follow_symlinks=False)
     except OSError:
         raise GuardianError("launcher is unavailable") from None
-    if not stat.S_ISREG(metadata.st_mode) or not os.access(str(path), os.X_OK):
+    if not stat.S_ISREG(metadata.st_mode):
+        raise GuardianError("launcher is invalid")
+    if _posix_runtime() and not os.access(str(path), os.X_OK):
         raise GuardianError("launcher is invalid")
     return path
 
@@ -193,6 +203,25 @@ def _create_input_directory(
                 os.rmdir(str(input_dir))
             except OSError:
                 pass
+        raise
+
+
+def _create_input_directory_path(workdir: Path) -> Tuple[Path, Tuple[int, int]]:
+    input_dir = Path(tempfile.mkdtemp(prefix="ag-model-router."))
+    try:
+        if _is_within(input_dir, workdir):
+            os.rmdir(str(input_dir))
+            raise GuardianError("input directory must be outside workdir")
+        os.chmod(str(input_dir), 0o700)
+        metadata = input_dir.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise GuardianError("input directory is invalid")
+        return input_dir, _directory_identity(metadata)
+    except Exception:
+        try:
+            os.rmdir(str(input_dir))
+        except OSError:
+            pass
         raise
 
 
@@ -483,6 +512,89 @@ def _validate_inputs(
             os.close(ready)
 
 
+def _open_input_path(input_dir: Path, name: str, limit: int) -> int:
+    path = input_dir / name
+    opened = -1
+    try:
+        if path.is_symlink():
+            raise GuardianError("router input is invalid")
+        opened = os.open(str(path), _open_regular_flags())
+        _validate_private_regular_metadata(os.fstat(opened), name, limit)
+        return opened
+    except GuardianError:
+        if opened >= 0:
+            os.close(opened)
+        raise
+    except OSError:
+        if opened >= 0:
+            os.close(opened)
+        raise GuardianError("router input is invalid") from None
+
+
+def _ready_exists_path(input_dir: Path) -> bool:
+    if (input_dir / READY_STAGING_NAME).exists():
+        return False
+    ready_path = input_dir / READY_NAME
+    if not ready_path.exists():
+        return False
+    if ready_path.is_symlink():
+        raise GuardianError("READY marker is invalid")
+    return True
+
+
+def _wait_until_ready_path(input_dir: Path, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while not _ready_exists_path(input_dir):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PreparationTimeout("preparation timeout")
+        time.sleep(min(READY_POLL_SECONDS, remaining))
+
+
+def _validate_inputs_path(
+    input_dir: Path,
+    expected_nonce: str,
+) -> Tuple[bytes, bytes]:
+    try:
+        entries = frozenset(entry.name for entry in input_dir.iterdir())
+    except OSError:
+        raise GuardianError("router inputs could not be listed") from None
+    if entries != EXPECTED_INPUTS:
+        raise GuardianError("router input set is invalid")
+    request = -1
+    task = -1
+    ready = -1
+    try:
+        request = _open_input_path(input_dir, REQUEST_NAME, MAX_REQUEST_BYTES)
+        task = _open_input_path(input_dir, TASK_NAME, MAX_TASK_BYTES)
+        ready = _open_input_path(input_dir, READY_NAME, MAX_READY_BYTES)
+        manifest = _parse_ready_manifest(
+            _read_bounded(ready, MAX_READY_BYTES),
+            expected_nonce,
+        )
+        request_snapshot = _snapshot_input_descriptor(
+            request,
+            REQUEST_NAME,
+            MAX_REQUEST_BYTES,
+        )
+        task_snapshot = _snapshot_task_descriptor(task)
+        for label, snapshot in (
+            ("request", request_snapshot),
+            ("task", task_snapshot),
+        ):
+            committed = manifest[label]
+            if len(snapshot) != committed["size"] or not hmac.compare_digest(
+                hashlib.sha256(snapshot).hexdigest(),
+                committed["sha256"],
+            ):
+                raise GuardianError("router input changed after READY")
+        return request_snapshot, task_snapshot
+    finally:
+        for descriptor in (request, task, ready):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
 def _scrub_directory(descriptor: int) -> bool:
     clean = True
     for _attempt in range(CLEANUP_PASSES):
@@ -517,6 +629,36 @@ def _scrub_directory(descriptor: int) -> bool:
         return False
 
 
+def _scrub_directory_path(input_dir: Path) -> bool:
+    clean = True
+    for _attempt in range(CLEANUP_PASSES):
+        try:
+            entries = tuple(input_dir.iterdir())
+        except OSError:
+            return False
+        if not entries:
+            return clean
+        removed_any = False
+        for entry in entries:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(metadata.st_mode):
+                    clean = False
+                    continue
+                entry.unlink()
+                removed_any = True
+            except FileNotFoundError:
+                removed_any = True
+            except OSError:
+                clean = False
+        if not removed_any:
+            break
+    try:
+        return clean and not tuple(input_dir.iterdir())
+    except OSError:
+        return False
+
+
 def _remove_bound_directory(
     parent_descriptor: int,
     basename: str,
@@ -539,6 +681,20 @@ def _remove_bound_directory(
         return False
 
 
+def _remove_path_directory(input_dir: Path, identity: Tuple[int, int]) -> bool:
+    try:
+        linked = input_dir.stat(follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(linked.st_mode) or _directory_identity(linked) != identity:
+        return False
+    try:
+        input_dir.rmdir()
+        return True
+    except OSError:
+        return False
+
+
 def _write_all(descriptor: int, payload: bytes) -> None:
     offset = 0
     while offset < len(payload):
@@ -551,6 +707,8 @@ def _write_all(descriptor: int, payload: bytes) -> None:
 def publish_ready(input_dir: Path, nonce: str) -> None:
     if not input_dir.is_absolute() or not _is_lower_hex(nonce, NONCE_HEX_LENGTH):
         raise GuardianError("READY publication input is invalid")
+    if not _posix_runtime():
+        return _publish_ready_path(input_dir, nonce)
     descriptor = -1
     staged = -1
     request = -1
@@ -642,6 +800,56 @@ def publish_ready(input_dir: Path, nonce: str) -> None:
                 pass
 
 
+def _publish_ready_path(input_dir: Path, nonce: str) -> None:
+    if input_dir.is_symlink() or not input_dir.is_dir():
+        raise GuardianError("READY publication input is invalid")
+    staged_path = input_dir / READY_STAGING_NAME
+    ready_path = input_dir / READY_NAME
+    published = False
+    request = -1
+    task = -1
+    staged = -1
+    try:
+        if frozenset(entry.name for entry in input_dir.iterdir()) != frozenset(
+            (REQUEST_NAME, TASK_NAME)
+        ):
+            raise GuardianError("READY publication input set is invalid")
+        request = _open_input_path(input_dir, REQUEST_NAME, MAX_REQUEST_BYTES)
+        task = _open_input_path(input_dir, TASK_NAME, MAX_TASK_BYTES)
+        request_snapshot = _snapshot_input_descriptor(
+            request,
+            REQUEST_NAME,
+            MAX_REQUEST_BYTES,
+        )
+        task_snapshot = _snapshot_task_descriptor(task)
+        manifest = _build_ready_manifest(request_snapshot, task_snapshot, nonce)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        staged = os.open(str(staged_path), flags, 0o600)
+        _write_all(staged, manifest)
+        os.fsync(staged)
+        os.close(staged)
+        staged = -1
+        os.replace(str(staged_path), str(ready_path))
+        published = True
+    except GuardianError:
+        raise
+    except OSError:
+        raise GuardianError("READY publication failed") from None
+    finally:
+        for descriptor in (request, task, staged):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if not published:
+            for path in (ready_path, staged_path):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
+
 def _signal_handler(signum, _frame) -> None:
     raise GuardianInterrupted(signum)
 
@@ -662,7 +870,7 @@ def _ignore_signals(signals: Sequence[int]) -> None:
 
 
 def _open_control_pipe() -> Tuple[int, int]:
-    if os.name != "posix":
+    if not _posix_runtime():
         return (-1, -1)
     read_descriptor, write_descriptor = os.pipe()
     try:
@@ -749,8 +957,24 @@ def _signal_registered_groups(active_groups: Set[int], sent_signal: int) -> None
 
 
 def _signal_child_group(process: subprocess.Popen, sent_signal: int) -> None:
+    if _windows_runtime():
+        force = sent_signal == signal.SIGKILL
+        command = ["taskkill", "/PID", str(process.pid), "/T"]
+        if force:
+            command.append("/F")
+        try:
+            subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                shell=False,
+            )
+            return
+        except OSError:
+            pass
     try:
-        if os.name == "posix" and hasattr(os, "killpg"):
+        if _posix_runtime() and hasattr(os, "killpg"):
             os.killpg(process.pid, sent_signal)
         else:
             if sent_signal == signal.SIGKILL:
@@ -799,7 +1023,7 @@ def _child_environment(control_write_descriptor: int = -1) -> dict:
 
 
 def _anonymous_request_file(snapshot: bytes):
-    if os.name != "posix":
+    if not _posix_runtime():
         raise GuardianError("anonymous request transport requires POSIX")
     handle = tempfile.TemporaryFile(mode="w+b")
     try:
@@ -820,12 +1044,81 @@ def _anonymous_request_file(snapshot: bytes):
         raise
 
 
-def _child_argv(args, request_descriptor: int) -> List[str]:
+class _RequestTransport:
+    def __init__(
+        self,
+        argv: Sequence[str],
+        pass_fds: Sequence[int] = (),
+        handle=None,
+        path: Optional[Path] = None,
+    ):
+        self.argv = list(argv)
+        self.pass_fds = tuple(pass_fds)
+        self.handle = handle
+        self.path = path
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+        if self.path is not None:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+            self.path = None
+
+
+def _request_transport(snapshot: bytes) -> _RequestTransport:
+    if _posix_runtime():
+        handle = _anonymous_request_file(snapshot)
+        descriptor = handle.fileno()
+        return _RequestTransport(
+            ["--request-fd", str(descriptor)],
+            pass_fds=(descriptor,),
+            handle=handle,
+        )
+    descriptor = -1
+    path = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="ag-model-router-request-",
+            suffix=".json",
+        )
+        path = Path(temporary_name)
+        os.chmod(str(path), 0o600)
+        _write_all(descriptor, snapshot)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        return _RequestTransport(["--request", str(path)], path=path)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _launcher_argv(launcher: Path) -> List[str]:
+    if launcher.suffix.lower() == ".py":
+        return [sys.executable, str(launcher)]
+    return [str(launcher)]
+
+
+def _default_launcher() -> Path:
+    name = "run-route.py" if _windows_runtime() else "run-route.sh"
+    return Path(__file__).with_name(name)
+
+
+def _child_argv(args, request_argv: Sequence[str]) -> List[str]:
     return [
-        str(args.launcher),
+        *_launcher_argv(args.launcher),
         "run",
-        "--request-fd",
-        str(request_descriptor),
+        *request_argv,
         "--workdir",
         str(args.workdir),
         "--sandbox",
@@ -840,7 +1133,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--launcher",
         type=Path,
-        default=Path(__file__).with_name("run-route.sh"),
+        default=_default_launcher(),
     )
     parser.add_argument("--workdir", type=Path, required=True)
     parser.add_argument(
@@ -861,10 +1154,129 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _spawn_child(
+    args,
+    request_transport: _RequestTransport,
+    control_write_descriptor: int,
+):
+    pass_descriptors = list(request_transport.pass_fds)
+    if control_write_descriptor >= 0:
+        pass_descriptors.append(control_write_descriptor)
+    process_options = {
+        "cwd": str(args.workdir),
+        "env": _child_environment(control_write_descriptor),
+        "stdin": subprocess.PIPE,
+        "shell": False,
+        "close_fds": True,
+        "start_new_session": _posix_runtime(),
+    }
+    if pass_descriptors:
+        process_options["pass_fds"] = tuple(pass_descriptors)
+    if _windows_runtime() and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    return subprocess.Popen(
+        _child_argv(args, request_transport.argv),
+        **process_options,
+    )
+
+
+def _run_path_lifecycle(args, handled_signals: Sequence[int]) -> int:
+    input_dir: Optional[Path] = None
+    directory_identity: Optional[Tuple[int, int]] = None
+    directory_removed = False
+    request_transport = None
+    child: Optional[subprocess.Popen] = None
+    exit_code = 125
+    try:
+        args.launcher = _validate_launcher(args.launcher)
+        args.workdir = _validate_workdir(args.workdir)
+        input_dir, directory_identity = _create_input_directory_path(args.workdir)
+        ready_nonce = secrets.token_hex(NONCE_HEX_LENGTH // 2)
+        event = {
+            "event": "input-ready",
+            "guardian_pid": os.getpid(),
+            "protocol": PROTOCOL,
+            "ready_nonce": ready_nonce,
+            "input_dir": str(input_dir),
+            "request_path": str(input_dir / REQUEST_NAME),
+            "task_path": str(input_dir / TASK_NAME),
+            "ready_path": str(input_dir / READY_NAME),
+            "transport": "path",
+        }
+        print(json.dumps(event, sort_keys=True, separators=(",", ":")), flush=True)
+        _wait_until_ready_path(input_dir, args.prepare_timeout)
+        request_snapshot, task_snapshot = _validate_inputs_path(
+            input_dir,
+            ready_nonce,
+        )
+        if not _scrub_directory_path(input_dir):
+            raise GuardianError("input directory cleanup failed")
+        directory_removed = _remove_path_directory(input_dir, directory_identity)
+        if not directory_removed:
+            raise GuardianError("input directory identity changed")
+        request_transport = _request_transport(request_snapshot)
+        deferred_signals: List[int] = []
+        spawn_error: Optional[BaseException] = None
+
+        def defer_signal(signum, _frame) -> None:
+            deferred_signals.append(signum)
+
+        for handled in handled_signals:
+            signal.signal(handled, defer_signal)
+        try:
+            child = _spawn_child(args, request_transport, -1)
+        except BaseException as error:
+            spawn_error = error
+        finally:
+            _install_signal_handlers(handled_signals)
+        if deferred_signals:
+            raise GuardianInterrupted(deferred_signals[0])
+        if spawn_error is not None:
+            raise spawn_error
+        child.communicate(input=task_snapshot)
+        child_status = child.returncode
+        if child_status is None:
+            child_status = child.wait()
+        exit_code = (
+            128 + abs(child_status)
+            if child_status < 0
+            else child_status
+        )
+    except GuardianInterrupted as interrupted:
+        exit_code = 128 + interrupted.signum
+    except PreparationTimeout:
+        print("guardian error: preparation timeout", file=sys.stderr)
+        exit_code = 124
+    except GuardianError:
+        print("guardian error: invalid input", file=sys.stderr)
+        exit_code = 2
+    except Exception:
+        print("guardian error: operation failed", file=sys.stderr)
+        exit_code = 125
+    finally:
+        _ignore_signals(handled_signals)
+        if child is not None:
+            _terminate_child(child)
+        if request_transport is not None:
+            request_transport.close()
+        if input_dir is not None and not directory_removed:
+            if _scrub_directory_path(input_dir) and directory_identity is not None:
+                directory_removed = _remove_path_directory(
+                    input_dir,
+                    directory_identity,
+                )
+            if not directory_removed:
+                print("guardian error: cleanup binding failed", file=sys.stderr)
+                exit_code = 125
+    return exit_code
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     handled_signals = _handled_signals()
     _install_signal_handlers(handled_signals)
+    if not _posix_runtime():
+        return _run_path_lifecycle(args, handled_signals)
     input_dir: Optional[Path] = None
     directory_descriptor = -1
     parent_descriptor = -1
@@ -874,7 +1286,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cleanup_binding_failed = False
     request_snapshot: Optional[bytes] = None
     task_snapshot: Optional[bytes] = None
-    request_file = None
+    request_transport = None
     control_read_descriptor = -1
     control_write_descriptor = -1
     child: Optional[subprocess.Popen] = None
@@ -916,7 +1328,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cleanup_binding_failed = not directory_removed
         if cleanup_binding_failed:
             raise GuardianError("input directory identity changed")
-        request_file = _anonymous_request_file(request_snapshot)
+        request_transport = _request_transport(request_snapshot)
         control_read_descriptor, control_write_descriptor = _open_control_pipe()
         deferred_signals: List[int] = []
         spawn_error: Optional[BaseException] = None
@@ -927,20 +1339,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for handled in handled_signals:
             signal.signal(handled, defer_signal)
         try:
-            request_descriptor = request_file.fileno()
-            pass_descriptors = [request_descriptor]
-            if control_write_descriptor >= 0:
-                pass_descriptors.append(control_write_descriptor)
-            child = subprocess.Popen(
-                _child_argv(args, request_descriptor),
-                cwd=str(args.workdir),
-                env=_child_environment(control_write_descriptor),
-                stdin=subprocess.PIPE,
-                shell=False,
-                close_fds=True,
-                pass_fds=tuple(pass_descriptors),
-                start_new_session=(os.name == "posix"),
-            )
+            child = _spawn_child(args, request_transport, control_write_descriptor)
         except BaseException as error:
             spawn_error = error
         finally:
@@ -977,8 +1376,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _terminate_child(child, control_read_descriptor)
         _close_descriptor(control_write_descriptor)
         _close_descriptor(control_read_descriptor)
-        if request_file is not None:
-            request_file.close()
+        if request_transport is not None:
+            request_transport.close()
         if directory_descriptor >= 0:
             if not _scrub_directory(directory_descriptor):
                 exit_code = 125
