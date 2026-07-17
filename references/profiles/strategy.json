@@ -1,0 +1,26 @@
+{
+  "id": "strategy",
+  "version": "1.0.0",
+  "signals": ["strategy", "estratégia", "decisão", "cenários"],
+  "benchmark_tags": ["professional-work", "decision-analysis"],
+  "required_capabilities": [
+    "professional-work",
+    "decision-analysis",
+    "source-grounding"
+  ],
+  "validator_categories": [
+    "assumptions",
+    "alternatives",
+    "evidence",
+    "contradictions",
+    "sensitivity",
+    "decision"
+  ],
+  "progress_metrics": [
+    "required_checks_passed",
+    "unsupported_assumptions",
+    "open_contradictions"
+  ],
+  "noisy_progress": true,
+  "critical_requires_independent_verifier": true
+}

@@ -1,0 +1,26 @@
+{
+  "id": "research",
+  "version": "1.0.0",
+  "signals": ["research", "pesquisa", "fontes", "evidências"],
+  "benchmark_tags": ["deep-research", "source-grounding"],
+  "required_capabilities": [
+    "source-grounding",
+    "web-research",
+    "conflict-analysis"
+  ],
+  "validator_categories": [
+    "sources",
+    "freshness",
+    "coverage",
+    "conflicts",
+    "attribution",
+    "question-fit"
+  ],
+  "progress_metrics": [
+    "required_checks_passed",
+    "unsupported_claims",
+    "source_conflicts_open"
+  ],
+  "noisy_progress": true,
+  "critical_requires_independent_verifier": true
+}

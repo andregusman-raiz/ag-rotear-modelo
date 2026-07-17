@@ -1,0 +1,457 @@
+<section id="ag-router-framework" aria-labelledby="ag-router-title">
+  <style>
+    #ag-router-framework {
+      --router-bg: var(--background, #0f172a);
+      --router-fg: var(--foreground, #e5e7eb);
+      --router-card: var(--card, #111827);
+      --router-card-fg: var(--card-foreground, #e5e7eb);
+      --router-muted: var(--muted-foreground, #94a3b8);
+      --router-border: var(--border, #334155);
+      --router-primary: var(--primary, #38bdf8);
+      --router-primary-fg: var(--primary-foreground, #082f49);
+      --router-accent: var(--accent, #1f2937);
+      --router-series-1: var(--viz-series-1, #38bdf8);
+      --router-series-2: var(--viz-series-2, #a78bfa);
+      --router-series-3: var(--viz-series-3, #34d399);
+      color: var(--router-fg);
+      font-family: inherit;
+    }
+
+    #ag-router-framework * {
+      box-sizing: border-box;
+    }
+
+    #ag-router-title {
+      margin: 0 0 0.35rem;
+      font-size: 1rem;
+      font-weight: 500;
+    }
+
+    #ag-router-framework .router-subtitle {
+      margin: 0 0 1rem;
+      color: var(--router-muted);
+    }
+
+    #ag-router-framework .router-layout {
+      display: grid;
+      grid-template-columns: minmax(220px, 0.85fr) minmax(320px, 1.6fr);
+      gap: 1rem;
+      align-items: start;
+    }
+
+    #ag-router-framework .router-card {
+      background: color-mix(in srgb, var(--router-card) 92%, transparent);
+      color: var(--router-card-fg);
+      border: 1px solid var(--router-border);
+      border-radius: 8px;
+      padding: 0.85rem;
+    }
+
+    #ag-router-framework .router-controls {
+      display: grid;
+      gap: 0.8rem;
+    }
+
+    #ag-router-framework label,
+    #ag-router-framework legend {
+      display: block;
+      margin: 0 0 0.25rem;
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+
+    #ag-router-framework select,
+    #ag-router-framework input[type="range"] {
+      width: 100%;
+    }
+
+    #ag-router-framework select {
+      border: 1px solid var(--router-border);
+      border-radius: 6px;
+      padding: 0.45rem 0.55rem;
+      background: var(--router-bg);
+      color: var(--router-fg);
+    }
+
+    #ag-router-framework .router-value {
+      color: var(--router-muted);
+      font-size: 0.85rem;
+    }
+
+    #ag-router-framework .router-stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.7rem;
+      margin-bottom: 1rem;
+    }
+
+    #ag-router-framework .router-stat strong {
+      display: block;
+      margin-top: 0.2rem;
+      font-size: 1.15rem;
+      font-weight: 500;
+    }
+
+    #ag-router-framework .router-stat span {
+      color: var(--router-muted);
+      font-size: 0.82rem;
+    }
+
+    #ag-router-framework .router-map {
+      display: grid;
+      grid-template-columns: 92px repeat(3, minmax(0, 1fr));
+      gap: 0.35rem;
+      align-items: stretch;
+    }
+
+    #ag-router-framework .router-cell,
+    #ag-router-framework .router-head,
+    #ag-router-framework .router-effort {
+      min-height: 48px;
+      border: 1px solid var(--router-border);
+      border-radius: 7px;
+      padding: 0.45rem;
+    }
+
+    #ag-router-framework .router-head,
+    #ag-router-framework .router-effort {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--router-muted);
+      font-size: 0.82rem;
+      text-align: center;
+    }
+
+    #ag-router-framework .router-cell {
+      position: relative;
+      background:
+        linear-gradient(
+          to top,
+          color-mix(in srgb, var(--router-primary) calc(var(--score) * 1%), transparent),
+          transparent
+        ),
+        color-mix(in srgb, var(--router-accent) 45%, transparent);
+      color: var(--router-fg);
+    }
+
+    #ag-router-framework .router-cell.is-selected {
+      outline: 2px solid var(--router-primary);
+      outline-offset: 1px;
+      background:
+        linear-gradient(
+          to top,
+          color-mix(in srgb, var(--router-primary) calc(var(--score) * 1%), transparent),
+          transparent
+        ),
+        color-mix(in srgb, var(--router-primary) 18%, var(--router-card));
+    }
+
+    #ag-router-framework .router-cell.is-blocked {
+      opacity: 0.45;
+    }
+
+    #ag-router-framework .router-cell b {
+      display: block;
+      font-size: 0.78rem;
+      font-weight: 500;
+    }
+
+    #ag-router-framework .router-cell span {
+      display: block;
+      margin-top: 0.15rem;
+      color: var(--router-muted);
+      font-size: 0.75rem;
+    }
+
+    #ag-router-framework .router-explain {
+      margin-top: 1rem;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.7rem;
+    }
+
+    #ag-router-framework .router-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      width: fit-content;
+      border: 1px solid var(--router-border);
+      border-radius: 999px;
+      padding: 0.15rem 0.5rem;
+      color: var(--router-muted);
+      font-size: 0.78rem;
+    }
+
+    #ag-router-framework .router-lane {
+      margin-top: 1rem;
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 0.45rem;
+    }
+
+    #ag-router-framework .router-step {
+      min-height: 62px;
+      border-bottom: 3px solid var(--router-border);
+      padding: 0.35rem 0.2rem;
+    }
+
+    #ag-router-framework .router-step.is-hot {
+      border-color: var(--router-primary);
+    }
+
+    #ag-router-framework .router-step b {
+      display: block;
+      font-size: 0.78rem;
+      font-weight: 500;
+    }
+
+    #ag-router-framework .router-step span {
+      color: var(--router-muted);
+      font-size: 0.74rem;
+    }
+
+    #ag-router-framework .router-note {
+      margin: 0.7rem 0 0;
+      color: var(--router-muted);
+      font-size: 0.82rem;
+    }
+
+    @media (max-width: 720px) {
+      #ag-router-framework .router-layout,
+      #ag-router-framework .router-explain,
+      #ag-router-framework .router-stats {
+        grid-template-columns: 1fr;
+      }
+
+      #ag-router-framework .router-map {
+        grid-template-columns: 74px repeat(3, minmax(76px, 1fr));
+        overflow-x: auto;
+        padding-bottom: 0.2rem;
+      }
+
+      #ag-router-framework .router-lane {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+
+  <h2 id="ag-router-title">Framework adaptativo de rota</h2>
+  <p class="router-subtitle">A rota nasce de perfil, restricoes, evidencias e Pareto; nao de uma tabela fixa.</p>
+
+  <div class="router-layout">
+    <form class="router-card router-controls" aria-label="Parametros da tarefa">
+      <div>
+        <label for="router-profile">Atividade</label>
+        <select id="router-profile">
+          <option value="software">Software</option>
+          <option value="research">Pesquisa</option>
+          <option value="data">Dados</option>
+          <option value="operations">Operacoes</option>
+          <option value="documents-design">Documentos e design</option>
+          <option value="strategy">Estrategia</option>
+        </select>
+      </div>
+
+      <div>
+        <label for="router-complexity">Complexidade <span class="router-value" id="router-complexity-value">3</span></label>
+        <input id="router-complexity" type="range" min="1" max="5" value="3">
+      </div>
+
+      <div>
+        <label for="router-risk">Risco de erro <span class="router-value" id="router-risk-value">3</span></label>
+        <input id="router-risk" type="range" min="1" max="5" value="3">
+      </div>
+
+      <div>
+        <label for="router-ambiguity">Ambiguidade <span class="router-value" id="router-ambiguity-value">2</span></label>
+        <input id="router-ambiguity" type="range" min="1" max="5" value="2">
+      </div>
+
+      <div>
+        <label for="router-budget">Pressao de custo <span class="router-value" id="router-budget-value">3</span></label>
+        <input id="router-budget" type="range" min="1" max="5" value="3">
+      </div>
+
+      <div>
+        <label for="router-latency">Pressao de latencia <span class="router-value" id="router-latency-value">3</span></label>
+        <input id="router-latency" type="range" min="1" max="5" value="3">
+      </div>
+    </form>
+
+    <div>
+      <div class="router-stats">
+        <div class="router-card router-stat">
+          <span>Rota ideal</span>
+          <strong id="router-choice">Terra / xhigh</strong>
+        </div>
+        <div class="router-card router-stat">
+          <span>Por que subiu</span>
+          <strong id="router-driver">risco</strong>
+        </div>
+        <div class="router-card router-stat">
+          <span>Modo</span>
+          <strong id="router-mode">Pareto</strong>
+        </div>
+      </div>
+
+      <div class="router-card">
+        <div class="router-map" id="router-map" role="img" aria-label="Mapa de rotas por modelo e esforco"></div>
+        <div class="router-explain">
+          <div>
+            <span class="router-pill">Luna</span>
+            <p class="router-note">Exploracao, tarefas pequenas, custo dominante, baixo risco.</p>
+          </div>
+          <div>
+            <span class="router-pill">Terra</span>
+            <p class="router-note">Padrao equilibrado para construir, testar, revisar e operar.</p>
+          </div>
+          <div>
+            <span class="router-pill">Sol</span>
+            <p class="router-note">Alta incerteza, arquitetura, seguranca, pesquisa profunda ou recuperacao.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="router-lane" aria-label="Fluxo de decisao">
+        <div class="router-step" data-step="fingerprint"><b>Fingerprint</b><span>perfil, risco, escopo</span></div>
+        <div class="router-step" data-step="gates"><b>Gates</b><span>permissoes, tools, budget</span></div>
+        <div class="router-step" data-step="evidence"><b>Evidencia</b><span>local, externa, oficial</span></div>
+        <div class="router-step" data-step="pareto"><b>Pareto</b><span>qualidade, custo, latencia</span></div>
+        <div class="router-step" data-step="validate"><b>Validar</b><span>observa e escala</span></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const root = document.getElementById("ag-router-framework");
+      const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
+      const models = [
+        { id: "luna", label: "Luna", price: 1, ceiling: 5, base: 0.58 },
+        { id: "terra", label: "Terra", price: 2.5, ceiling: 6, base: 0.73 },
+        { id: "sol", label: "Sol", price: 5, ceiling: 6, base: 0.86 }
+      ];
+      const profileBias = {
+        software: { depth: 1, risk: 1, evidence: "terminal-bench" },
+        research: { depth: 2, risk: 1, evidence: "BrowseComp / HLE" },
+        data: { depth: 1, risk: 2, evidence: "invariantes locais" },
+        operations: { depth: 1, risk: 2, evidence: "AutomationBench" },
+        "documents-design": { depth: 0, risk: 1, evidence: "validacao visual" },
+        strategy: { depth: 1, risk: 1, evidence: "decisao comparativa" }
+      };
+      const effortWeight = { low: 1, medium: 2, high: 3, xhigh: 4, max: 5, ultra: 6 };
+      const controls = ["complexity", "risk", "ambiguity", "budget", "latency"];
+      const map = root.querySelector("#router-map");
+
+      function value(name) {
+        return Number(root.querySelector("#router-" + name).value);
+      }
+
+      function scoreRoute(model, effort, context) {
+        const effortValue = effortWeight[effort];
+        if (effortValue > model.ceiling) return { score: -1, blocked: true };
+        const neededDepth = context.complexity + context.ambiguity + context.bias.depth;
+        const neededSafety = context.risk + context.bias.risk;
+        const totalPressure = neededDepth + neededSafety;
+        let modelFit = 0;
+        if (model.id === "luna") modelFit = totalPressure <= 7 ? 8 : -8;
+        if (model.id === "terra") modelFit = totalPressure >= 7 && totalPressure <= 12 ? 10 : 0;
+        if (model.id === "sol") modelFit = totalPressure >= 11 ? 8 : -4;
+        const quality = model.base * 40 + effortValue * 8 + neededDepth * 2 + neededSafety;
+        const waste = Math.max(0, effortValue - Math.ceil((neededDepth + neededSafety) / 3)) * 4;
+        const costPenalty = model.price * context.budget * 2.6 + effortValue * context.latency * 1.8;
+        const riskPenalty = Math.max(0, neededSafety - (model.base * 5 + effortValue)) * 9;
+        return {
+          score: Math.max(0, Math.min(100, quality + modelFit - waste - costPenalty - riskPenalty)),
+          blocked: false
+        };
+      }
+
+      function context() {
+        const profile = root.querySelector("#router-profile").value;
+        return {
+          profile,
+          bias: profileBias[profile],
+          complexity: value("complexity"),
+          risk: value("risk"),
+          ambiguity: value("ambiguity"),
+          budget: value("budget"),
+          latency: value("latency")
+        };
+      }
+
+      function driver(ctx) {
+        const candidates = [
+          ["profundidade", ctx.complexity + ctx.ambiguity + ctx.bias.depth],
+          ["risco", ctx.risk + ctx.bias.risk],
+          ["custo", ctx.budget],
+          ["latencia", ctx.latency]
+        ].sort((a, b) => b[1] - a[1]);
+        return candidates[0][0];
+      }
+
+      function render() {
+        const ctx = context();
+        controls.forEach((name) => {
+          root.querySelector("#router-" + name + "-value").textContent = String(value(name));
+        });
+        const cells = [];
+        models.forEach((model) => {
+          efforts.forEach((effort) => {
+            cells.push({ model, effort, ...scoreRoute(model, effort, ctx) });
+          });
+        });
+        const viable = cells.filter((cell) => !cell.blocked);
+        viable.sort((a, b) => b.score - a.score);
+        const best = viable[0];
+        root.querySelector("#router-choice").textContent = best.model.label + " / " + best.effort;
+        root.querySelector("#router-driver").textContent = driver(ctx);
+        root.querySelector("#router-mode").textContent = ctx.bias.evidence;
+
+        map.innerHTML = "";
+        map.appendChild(cell("router-head", ""));
+        models.forEach((model) => map.appendChild(cell("router-head", model.label)));
+        efforts.slice().reverse().forEach((effort) => {
+          map.appendChild(cell("router-effort", effort));
+          models.forEach((model) => {
+            const found = cells.find((item) => item.model.id === model.id && item.effort === effort);
+            const item = cell(
+              "router-cell" +
+                (found === best ? " is-selected" : "") +
+                (found.blocked ? " is-blocked" : ""),
+              ""
+            );
+            item.style.setProperty("--score", String(Math.round(found.score)));
+            item.setAttribute(
+              "aria-label",
+              model.label + " " + effort + ", score " + Math.round(found.score)
+            );
+            item.innerHTML = "<b>" + Math.round(found.score) + "</b><span>" +
+              (found.blocked ? "indisponivel" : model.label + " " + effort) +
+              "</span>";
+            map.appendChild(item);
+          });
+        });
+
+        const hotStep = driver(ctx) === "custo" || driver(ctx) === "latencia" ? "pareto" : "evidence";
+        root.querySelectorAll(".router-step").forEach((step) => {
+          step.classList.toggle("is-hot", step.dataset.step === hotStep);
+        });
+      }
+
+      function cell(className, text) {
+        const element = document.createElement("div");
+        element.className = className;
+        element.textContent = text;
+        return element;
+      }
+
+      root.querySelectorAll("select, input").forEach((control) => {
+        control.addEventListener("input", render);
+        control.addEventListener("change", render);
+      });
+      render();
+    })();
+  </script>
+</section>

@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raiz.education/schemas/model-router/benchmark-registry-1.0.0.json",
+  "title": "Adaptive model router benchmark registry",
+  "$comment": "Draft 2020-12 is phase 1. Source references, duplicate source/observation IDs, semantic duplicate observations, and active model-effort support are mandatory phase-2 invariants enforced by validate_registry_document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "verified_at", "sources", "observations"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "verified_at": {"$ref": "#/$defs/date"},
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/source"}
+    },
+    "observations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/observation"}
+    }
+  },
+  "$defs": {
+    "nonBlank": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!\\s)(?:.|\\n)*\\S$"
+    },
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "date": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "owner", "url", "status", "kind", "limitations"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "owner": {"$ref": "#/$defs/nonBlank"},
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://(?![^/?#\\s]*@)[^/?#\\s]+(?:[/?#][^\\s]*)?$"
+        },
+        "status": {"enum": ["active", "quarantine", "retired"]},
+        "kind": {"enum": ["vendor", "independent-aggregator", "primary-independent"]},
+        "limitations": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/nonBlank"}
+        }
+      }
+    },
+    "metric": {
+      "oneOf": [
+        {"$ref": "#/$defs/percentArc1"},
+        {"$ref": "#/$defs/percentArc2"},
+        {"$ref": "#/$defs/percentArc3"},
+        {"$ref": "#/$defs/percentAutomation"},
+        {"$ref": "#/$defs/indexIntelligence"}
+      ]
+    },
+    "percentArc1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit"],
+      "properties": {
+        "name": {"const": "arc-agi-1-public-eval"},
+        "value": {"type": "number", "minimum": 0, "maximum": 100},
+        "unit": {"const": "percent"}
+      }
+    },
+    "percentArc2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit"],
+      "properties": {
+        "name": {"const": "arc-agi-2-public-eval"},
+        "value": {"type": "number", "minimum": 0, "maximum": 100},
+        "unit": {"const": "percent"}
+      }
+    },
+    "percentArc3": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit"],
+      "properties": {
+        "name": {"const": "arc-agi-3-public-demo"},
+        "value": {"type": "number", "minimum": 0, "maximum": 100},
+        "unit": {"const": "percent"}
+      }
+    },
+    "percentAutomation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit"],
+      "properties": {
+        "name": {"const": "task-completed-correctly"},
+        "value": {"type": "number", "minimum": 0, "maximum": 100},
+        "unit": {"const": "percent"}
+      }
+    },
+    "indexIntelligence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit"],
+      "properties": {
+        "name": {"const": "artificial-analysis-intelligence-index"},
+        "value": {"type": "number", "minimum": 0},
+        "unit": {"const": "index-points"}
+      }
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit"],
+      "properties": {
+        "name": {"const": "cost-per-task"},
+        "value": {"type": "number", "minimum": 0},
+        "unit": {"const": "USD/task"}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "source_id", "benchmark", "dataset", "harness", "model",
+        "effort", "topology", "topology_declared", "profile_tags", "metric", "cost"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "source_id": {"$ref": "#/$defs/identifier"},
+        "benchmark": {"$ref": "#/$defs/nonBlank"},
+        "dataset": {"$ref": "#/$defs/nonBlank"},
+        "harness": {"$ref": "#/$defs/nonBlank"},
+        "model": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"},
+        "effort": {"enum": ["low", "medium", "high", "xhigh", "max", "ultra"]},
+        "topology": {"enum": ["single", "multi", "unspecified"]},
+        "topology_declared": {"type": "boolean"},
+        "profile_tags": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/nonBlank"}
+        },
+        "metric": {"$ref": "#/$defs/metric"},
+        "cost": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/cost"}]},
+        "evaluated_at": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/date"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"effort": {"const": "ultra"}}, "required": ["effort"]},
+          "then": {"properties": {"topology": {"const": "multi"}, "topology_declared": {"const": true}}}
+        },
+        {
+          "if": {"properties": {"topology": {"const": "multi"}}, "required": ["topology"]},
+          "then": {"properties": {"effort": {"const": "ultra"}, "topology_declared": {"const": true}}}
+        },
+        {
+          "if": {"properties": {"topology": {"const": "unspecified"}}, "required": ["topology"]},
+          "then": {"properties": {"topology_declared": {"const": false}, "effort": {"not": {"const": "ultra"}}}}
+        },
+        {
+          "if": {"properties": {"topology_declared": {"const": false}}, "required": ["topology_declared"]},
+          "then": {"properties": {"topology": {"const": "unspecified"}}}
+        },
+        {
+          "if": {"properties": {"topology_declared": {"const": true}}, "required": ["topology_declared"]},
+          "then": {"properties": {"topology": {"enum": ["single", "multi"]}}}
+        }
+      ]
+    }
+  }
+}

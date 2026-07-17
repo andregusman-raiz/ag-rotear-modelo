@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"thread-failure"}
+{"type":"turn.failed","error":{"message":"model execution failed","type":"transient"}}
+{"type":"error","message":"request aborted","future_field":"ignored"}

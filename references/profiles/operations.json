@@ -1,0 +1,27 @@
+{
+  "id": "operations",
+  "version": "1.0.0",
+  "signals": ["operations", "operações", "deploy", "migração"],
+  "benchmark_tags": ["computer-use", "tool-use"],
+  "required_capabilities": [
+    "tool-use",
+    "state-change",
+    "recovery-planning"
+  ],
+  "validator_categories": [
+    "before-state",
+    "after-state",
+    "dry-run",
+    "idempotence",
+    "permissions",
+    "recovery",
+    "rollback"
+  ],
+  "progress_metrics": [
+    "required_checks_passed",
+    "state_drift",
+    "rollback_gaps"
+  ],
+  "noisy_progress": false,
+  "critical_requires_independent_verifier": true
+}

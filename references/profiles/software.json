@@ -1,0 +1,23 @@
+{
+  "id": "software",
+  "version": "1.0.0",
+  "signals": ["software", "código", "implementação", "bug"],
+  "benchmark_tags": ["coding", "software-engineering"],
+  "required_capabilities": ["correctness", "tool-use", "code-change"],
+  "validator_categories": [
+    "tests",
+    "typecheck",
+    "lint",
+    "build",
+    "diff-scope",
+    "security",
+    "acceptance"
+  ],
+  "progress_metrics": [
+    "required_checks_passed",
+    "test_failures",
+    "type_errors"
+  ],
+  "noisy_progress": false,
+  "critical_requires_independent_verifier": true
+}

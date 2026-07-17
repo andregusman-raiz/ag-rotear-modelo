@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"thread-smoke","future_field":"ignored"}
+{"type":"item.completed","item":{"id":"message-one","type":"agent_message","text":"intermediate text is not the final report"}}
+{"type":"item.completed","item":{"id":"message-two","type":"agent_message","text":"{\"status\":\"pass\",\"deliverable\":\"validated child execution\",\"evidence\":[{\"category\":\"tests\",\"passed\":true,\"summary\":\"targeted tests passed\",\"exit_code\":0}],\"metrics\":{\"passed_checks\":1.0},\"failure_class\":null,\"next_hint\":null}","future_field":"ignored"},"future_field":"ignored"}
+{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":40,"reasoning_output_tokens":8,"future_field":999},"future_field":"ignored"}

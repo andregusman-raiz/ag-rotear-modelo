@@ -1,0 +1,6 @@
+interface:
+  display_name: "Roteador Adaptativo de Modelos"
+  short_description: "Roteia modelo e esforço com evidências"
+  default_prompt: "Use $ag-rotear-modelo para escolher, executar e validar a rota ideal."
+policy:
+  allow_implicit_invocation: true

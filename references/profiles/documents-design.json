@@ -1,0 +1,26 @@
+{
+  "id": "documents-design",
+  "version": "1.0.0",
+  "signals": ["documents-design", "documentos", "apresentações", "design"],
+  "benchmark_tags": ["document-production", "visual-design"],
+  "required_capabilities": [
+    "document-production",
+    "visual-reasoning",
+    "tool-use"
+  ],
+  "validator_categories": [
+    "content",
+    "reference-fidelity",
+    "render",
+    "legibility",
+    "accessibility",
+    "visual-consistency"
+  ],
+  "progress_metrics": [
+    "required_checks_passed",
+    "render_errors",
+    "accessibility_failures"
+  ],
+  "noisy_progress": true,
+  "critical_requires_independent_verifier": true
+}

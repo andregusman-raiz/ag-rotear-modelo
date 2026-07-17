@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ChildReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "deliverable",
+    "evidence",
+    "metrics",
+    "failure_class",
+    "next_hint"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["pass", "fail", "blocked"]
+    },
+    "deliverable": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "passed", "summary"],
+        "properties": {
+          "category": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "exit_code": {
+            "type": ["integer", "null"]
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "propertyNames": {
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "additionalProperties": {
+        "type": "number"
+      }
+    },
+    "failure_class": {
+      "type": ["string", "null"],
+      "enum": [
+        "transient",
+        "depth",
+        "capacity",
+        "coverage",
+        "risk",
+        "external_block",
+        null
+      ]
+    },
+    "next_hint": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "pattern": "\\S"
+    }
+  }
+}

@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "primary_profile",
+    "secondary_profiles",
+    "archetype",
+    "novelty",
+    "ambiguity",
+    "reasoning_depth",
+    "context_load",
+    "tool_dependency",
+    "urgency",
+    "cost_tolerance",
+    "latency_tolerance",
+    "verifiability",
+    "impact",
+    "reversibility",
+    "external_effects",
+    "external_effects_authorized",
+    "decomposability",
+    "independent_fronts",
+    "parallel_writes",
+    "worktree_isolated",
+    "required_tools",
+    "acceptance_criteria",
+    "validation_checks"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "primary_profile": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "secondary_profiles": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    },
+    "archetype": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "novelty": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "ood"]
+    },
+    "ambiguity": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "reasoning_depth": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "context_load": {
+      "type": "string",
+      "enum": ["small", "medium", "large", "distributed"]
+    },
+    "tool_dependency": {
+      "type": "string",
+      "enum": ["none", "low", "high"]
+    },
+    "urgency": {
+      "type": "string",
+      "enum": ["low", "normal", "high"]
+    },
+    "cost_tolerance": {
+      "type": "string",
+      "enum": ["low", "default", "high"]
+    },
+    "latency_tolerance": {
+      "type": "string",
+      "enum": ["low", "default", "high"]
+    },
+    "verifiability": {
+      "type": "string",
+      "enum": ["strong", "mixed", "weak"]
+    },
+    "impact": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "critical"]
+    },
+    "reversibility": {
+      "type": "string",
+      "enum": ["easy", "partial", "hard"]
+    },
+    "external_effects": {
+      "type": "boolean"
+    },
+    "external_effects_authorized": {
+      "type": "boolean"
+    },
+    "decomposability": {
+      "type": "string",
+      "enum": ["none", "limited", "high"]
+    },
+    "independent_fronts": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "parallel_writes": {
+      "type": "boolean"
+    },
+    "worktree_isolated": {
+      "type": "boolean"
+    },
+    "required_tools": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    },
+    "validation_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "required"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "category": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

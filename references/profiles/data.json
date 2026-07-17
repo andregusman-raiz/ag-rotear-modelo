@@ -1,0 +1,26 @@
+{
+  "id": "data",
+  "version": "1.0.0",
+  "signals": ["data", "dados", "schema", "reconciliação"],
+  "benchmark_tags": ["data-analysis", "data-reconciliation"],
+  "required_capabilities": [
+    "schema-reasoning",
+    "quantitative-reconciliation",
+    "tool-use"
+  ],
+  "validator_categories": [
+    "schema",
+    "counts",
+    "reconciliation",
+    "invariants",
+    "lineage",
+    "samples"
+  ],
+  "progress_metrics": [
+    "required_checks_passed",
+    "unreconciled_count",
+    "invariant_failures"
+  ],
+  "noisy_progress": false,
+  "critical_requires_independent_verifier": true
+}
